@@ -1,34 +1,20 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
 import './App.css'
+import { GoogleLoginCard } from './components/GoogleLoginCard'
 
 function App() {
-  const [count, setCount] = useState(0)
-
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
+    <div className="page">
+      <header className="page__header">
+        <span className="page__eyebrow">Google Drive 연결</span>
+        <h1 className="page__title">한 번의 승인으로 로그인과 Drive 접근까지</h1>
+        <p className="page__subtitle">
+          아래 버튼을 누르면 Google 계정 확인과 동시에 Drive 파일 접근 권한을 요청합니다.
+          승인하면 백엔드가 access/refresh 토큰을 교환해 안전하게 저장합니다.
         </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
+      </header>
+
+      <GoogleLoginCard />
+    </div>
   )
 }
 
