@@ -22,9 +22,21 @@ export function DriveSetupPage() {
   const [reloadIndex, setReloadIndex] = useState(0)
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
+  const [authSuccessMessage, setAuthSuccessMessage] = useState<string | null>(null)
 
   useEffect(() => {
     try {
+      const stored = sessionStorage.getItem(DRIVE_AUTH_STORAGE_KEY)
+      if (stored) {
+        try {
+          const parsed = JSON.parse(stored) as { message?: unknown }
+          if (typeof parsed?.message === 'string' && parsed.message.trim()) {
+            setAuthSuccessMessage(parsed.message)
+          }
+        } catch (error) {
+          console.error('failed to parse drive auth message', error)
+        }
+      }
       sessionStorage.removeItem(DRIVE_AUTH_STORAGE_KEY)
     } catch (error) {
       console.error('failed to clear auth message', error)
@@ -111,6 +123,18 @@ export function DriveSetupPage() {
   const projects = result?.projects ?? []
   const folderName = result?.folderName ?? 'gs'
 
+  const bannerMessage = useMemo(() => {
+    if (result?.folderCreated) {
+      return `'${result.folderName}' 폴더를 Google Drive에 새로 만들었습니다.`
+    }
+
+    if (successMessage) {
+      return successMessage
+    }
+
+    return authSuccessMessage
+  }, [authSuccessMessage, result, successMessage])
+
   return (
     <PageLayout>
       <div className="drive-page">
@@ -139,13 +163,7 @@ export function DriveSetupPage() {
         )}
 
         {viewState === 'ready' && result && (
-          <DriveCard
-            banner={
-              result.folderCreated
-                ? `'${result.folderName}' 폴더를 Google Drive에 새로 만들었습니다.`
-                : successMessage
-            }
-          >
+          <DriveCard banner={bannerMessage}>
             <h2 className="drive-card__title">프로젝트 선택</h2>
             <p className="drive-card__description">
               {projects.length > 0

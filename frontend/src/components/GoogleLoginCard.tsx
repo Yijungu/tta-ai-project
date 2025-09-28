@@ -12,6 +12,8 @@ const SCOPES = [
   '사용자가 만든 파일 관리 (생성/수정/삭제)',
 ]
 
+const PROJECTS_ROOT_PATH = '/projects'
+
 export function GoogleLoginCard() {
   const [status, setStatus] = useState<AuthStatus>(null)
   const [message, setMessage] = useState<string>('')
@@ -29,6 +31,7 @@ export function GoogleLoginCard() {
   })
   useEffect(() => {
     let redirectTimer: number | undefined
+    let hardRedirectTimer: number | undefined
 
     if (initialQuery.auth === 'success') {
       setStatus('success')
@@ -49,8 +52,12 @@ export function GoogleLoginCard() {
       }
 
       redirectTimer = window.setTimeout(() => {
-        navigate('/drive', { replace: true })
-      }, 1200)
+        navigate(PROJECTS_ROOT_PATH, { replace: true })
+      }, 800)
+
+      hardRedirectTimer = window.setTimeout(() => {
+        window.location.replace(PROJECTS_ROOT_PATH)
+      }, 2000)
     } else if (initialQuery.auth === 'error') {
       setStatus('error')
       setMessage(initialQuery.message ?? 'Google 인증이 취소되었습니다.')
@@ -64,6 +71,9 @@ export function GoogleLoginCard() {
     return () => {
       if (redirectTimer) {
         window.clearTimeout(redirectTimer)
+      }
+      if (hardRedirectTimer) {
+        window.clearTimeout(hardRedirectTimer)
       }
     }
   }, [initialQuery])
