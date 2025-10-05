@@ -5,6 +5,7 @@ import { DriveSetupPage } from '../../pages/DriveSetupPage'
 import { LoginPage } from '../../pages/LoginPage'
 import { ProjectManagementPage } from '../../pages/ProjectManagementPage'
 import { PromptAdminPage } from '../../pages/PromptAdminPage'
+import { normalizePathname } from './normalizePathname'
 
 const PROJECT_PATH_PATTERN = /^\/projects\/([^/]+)$/
 const PROJECTS_ROOT_PATH = '/projects'
@@ -17,19 +18,21 @@ interface ResolvePageOptions {
 }
 
 export function resolvePage({ pathname, authStatus }: ResolvePageOptions): ReactNode {
+  const normalizedPathname = normalizePathname(pathname)
+
   if (authStatus !== 'authenticated') {
     return <LoginPage />
   }
 
-  if (pathname === PROJECTS_ROOT_PATH || pathname === LEGACY_DRIVE_PATH) {
+  if (normalizedPathname === PROJECTS_ROOT_PATH || normalizedPathname === LEGACY_DRIVE_PATH) {
     return <DriveSetupPage />
   }
 
-  if (pathname === PROMPT_ADMIN_PATH) {
+  if (normalizedPathname === PROMPT_ADMIN_PATH) {
     return <PromptAdminPage />
   }
 
-  const projectMatch = pathname.match(PROJECT_PATH_PATTERN)
+  const projectMatch = normalizedPathname.match(PROJECT_PATH_PATTERN)
   if (projectMatch) {
     return <ProjectManagementPage projectId={decodeURIComponent(projectMatch[1])} />
   }

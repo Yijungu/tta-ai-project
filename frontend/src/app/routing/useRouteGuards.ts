@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 
 import type { AuthStatus } from '../../auth'
 import { navigate } from '../../navigation'
+import { normalizePathname } from './normalizePathname'
 
 const PROJECT_PATH_PATTERN = /^\/projects\/(.+)$/
 const PROJECTS_ROOT_PATH = '/projects'
