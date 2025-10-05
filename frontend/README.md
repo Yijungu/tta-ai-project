@@ -67,3 +67,11 @@ export default defineConfig([
   },
 ])
 ```
+
+## Regression verification
+
+To confirm that project routes with query parameters remain accessible:
+
+1. Sign in to the application.
+2. Navigate directly to a project detail page such as `/projects/123?name=demo` using the address bar or an internal link.
+3. Verify that you remain on the project management view (rather than being redirected back to `/projects`) and that reloading the page preserves the view.
