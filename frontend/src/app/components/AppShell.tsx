@@ -4,12 +4,14 @@ interface AppShellProps {
   isAuthenticated: boolean
   onLogout: () => void
   onOpenDrive: () => void
+  onOpenPromptAdmin: () => void
 }
 
 export function AppShell({
   isAuthenticated,
   onLogout,
   onOpenDrive,
+  onOpenPromptAdmin,
   children,
 }: PropsWithChildren<AppShellProps>) {
   return (
@@ -18,6 +20,13 @@ export function AppShell({
         <div className="app-shell__brand">TTA AI 프로젝트 허브</div>
         {isAuthenticated && (
           <nav aria-label="계정 메뉴" className="app-shell__nav">
+            <button
+              type="button"
+              className="app-shell__prompt-admin"
+              onClick={onOpenPromptAdmin}
+            >
+              프롬프트 관리
+            </button>
             <button type="button" className="app-shell__drive" onClick={onOpenDrive}>
               구글 드라이브
             </button>

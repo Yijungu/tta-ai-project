@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,6 +21,9 @@ class Settings:
     tokens_path: Path
     openai_api_key: str
     openai_model: str
+    prompt_store_path: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parent / "prompt_templates.json"
+    )
 
     @property
     def frontend_origin(self) -> str:
@@ -46,4 +49,8 @@ def load_settings() -> Settings:
         tokens_path=Path(tokens_env) if tokens_env else default_tokens_path,
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        prompt_store_path=Path(
+            os.getenv("PROMPT_STORE_PATH")
+            or (Path(__file__).resolve().parent / "prompt_templates.json")
+        ),
     )
