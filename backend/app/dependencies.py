@@ -6,6 +6,7 @@ from .container import Container
 from .services.ai_generation import AIGenerationService
 from .services.google_drive import GoogleDriveService
 from .services.oauth import GoogleOAuthService
+from .services.prompt_store import PromptStore
 from .token_store import TokenStorage
 
 
@@ -32,3 +33,7 @@ def get_ai_generation_service(
     container: Container = Depends(get_container),
 ) -> AIGenerationService:
     return container.ai_generation_service
+
+
+def get_prompt_store(container: Container = Depends(get_container)) -> PromptStore:
+    return container.prompt_store
