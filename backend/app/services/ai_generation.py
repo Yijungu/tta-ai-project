@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
@@ -46,6 +47,23 @@ class UploadContext:
 class PromptContextPreview:
     descriptor: str
     doc_id: str | None
+
+
+@dataclass(frozen=True)
+class AttachmentPreview:
+    name: str
+    label: str
+    role: str
+    builtin: bool
+    size_bytes: int | None
+    content_type: str | None
+
+
+@dataclass(frozen=True)
+class PromptPreviewData:
+    user_prompt: str
+    descriptor_lines: List[str]
+    closing_note: str | None
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +188,79 @@ class AIGenerationService:
             previews.append(PromptContextPreview(descriptor=cleaned, doc_id=doc_id))
         return previews
 
+    @staticmethod
+    def _build_user_prompt_preview(
+        menu_id: str,
+        instruction: str,
+        contexts: List[UploadContext],
+    ) -> PromptPreviewData:
+        context_previews = AIGenerationService._build_context_previews(contexts)
+        closing_note = AIGenerationService._closing_note(menu_id, context_previews)
+
+        descriptors: List[str] = []
+        enumerated_lines: List[str] = []
+        for index, preview in enumerate(context_previews, start=1):
+            cleaned = preview.descriptor.strip()
+            if not cleaned:
+                continue
+            descriptors.append(cleaned)
+            enumerated_lines.append(f"{index}. {cleaned}")
+
+        descriptor_block = "\n".join(enumerated_lines)
+
+        user_prompt_parts = [
+            instruction,
+            (
+                "다음 첨부 파일을 참고하여 요구사항을 분석하고 지침에 맞는 CSV를 작성하세요."
+            ),
+            "각 파일은 업로드된 순서대로 첨부되어 있습니다.",
+        ]
+        if descriptor_block:
+            user_prompt_parts.append("첨부 파일 목록:")
+            user_prompt_parts.append(descriptor_block)
+        if closing_note:
+            user_prompt_parts.append(closing_note)
+        user_prompt_parts.append("CSV 이외의 다른 형식이나 설명 문장은 포함하지 마세요.")
+
+        user_prompt = "\n\n".join(part for part in user_prompt_parts if part.strip())
+
+        return PromptPreviewData(
+            user_prompt=user_prompt,
+            descriptor_lines=descriptors,
+            closing_note=closing_note,
+        )
+
+    @staticmethod
+    def describe_builtin_attachments(menu_id: str) -> List[AttachmentPreview]:
+        contexts = AIGenerationService._builtin_attachment_contexts(menu_id)
+        previews: List[AttachmentPreview] = []
+        for context in contexts:
+            upload = context.upload
+            metadata = context.metadata or {}
+            content_type = (upload.content_type or "").split(";")[0].strip()
+            if not content_type:
+                guessed, _ = mimetypes.guess_type(upload.name)
+                content_type = guessed or "application/octet-stream"
+            size = len(upload.content) if upload.content is not None else None
+            previews.append(
+                AttachmentPreview(
+                    name=upload.name,
+                    label=str(metadata.get("label") or upload.name),
+                    role=str(metadata.get("role") or "additional"),
+                    builtin=bool(metadata.get("builtin")),
+                    size_bytes=size,
+                    content_type=content_type,
+                )
+            )
+        return previews
+
+    @classmethod
+    def describe_prompt_preview(
+        cls, menu_id: str, instruction: str
+    ) -> PromptPreviewData:
+        contexts = cls._builtin_attachment_contexts(menu_id)
+        return cls._build_user_prompt_preview(menu_id, instruction, contexts)
+
     async def _upload_openai_file(self, client: OpenAI, context: UploadContext) -> str:
         upload = context.upload
         stream = io.BytesIO(upload.content)
@@ -267,15 +358,9 @@ class AIGenerationService:
         uploaded_attachments: List[AttachmentMetadata] = []
 
         try:
-            context_previews = self._build_context_previews(contexts)
-            closing_note = self._closing_note(menu_id, context_previews)
-
-            descriptor_lines = [
-                f"{index}. {preview.descriptor}"
-                for index, preview in enumerate(context_previews, start=1)
-                if preview.descriptor.strip()
-            ]
-            descriptor_section = "\n".join(descriptor_lines)
+            preview = self._build_user_prompt_preview(
+                menu_id, prompt["instruction"], contexts
+            )
 
             for context in contexts:
                 kind = self._attachment_kind(context.upload)
@@ -297,27 +382,11 @@ class AIGenerationService:
                 if not metadata.get("builtin"):
                     cleanup_file_ids.append(file_id)
 
-            user_prompt_parts = [
-                prompt["instruction"],
-                (
-                    "다음 첨부 파일을 참고하여 요구사항을 분석하고 지침에 맞는 CSV를 작성하세요."
-                ),
-                "각 파일은 업로드된 순서대로 첨부되어 있습니다.",
-            ]
-            if descriptor_section:
-                user_prompt_parts.append("첨부 파일 목록:")
-                user_prompt_parts.append(descriptor_section)
-            if closing_note:
-                user_prompt_parts.append(closing_note)
-            user_prompt_parts.append("CSV 이외의 다른 형식이나 설명 문장은 포함하지 마세요.")
-
-            user_prompt = "\n\n".join(part for part in user_prompt_parts if part.strip())
-
             messages = [
                 OpenAIMessageBuilder.text_message("system", prompt["system"]),
                 OpenAIMessageBuilder.text_message(
                     "user",
-                    user_prompt,
+                    preview.user_prompt,
                     attachments=uploaded_attachments,
                 ),
             ]
@@ -330,7 +399,7 @@ class AIGenerationService:
                     "project_id": project_id,
                     "menu_id": menu_id,
                     "system_prompt": prompt["system"],
-                    "user_prompt": user_prompt,
+                    "user_prompt": preview.user_prompt,
                 },
             )
 
@@ -402,9 +471,9 @@ class AIGenerationService:
         return [UploadContext(upload=upload, metadata=metadata)]
 
     @staticmethod
-    def _load_feature_template_pdf(menu_id: str, template_path: Path) -> BufferedUpload:
+    def _feature_template_pdf_bytes(menu_id: str, template_path: Path) -> bytes:
         try:
-            content = template_path.read_bytes()
+            return AIGenerationService._cached_feature_template_pdf(template_path.as_posix())
         except FileNotFoundError as exc:
             logger.error(
                 "기능리스트 예제 파일을 찾을 수 없습니다.",
@@ -423,9 +492,6 @@ class AIGenerationService:
                 status_code=500,
                 detail="기능리스트 예제 파일을 읽는 중 오류가 발생했습니다.",
             ) from exc
-
-        try:
-            rows = AIGenerationService._parse_xlsx_rows(content)
         except ValueError as exc:
             logger.error(
                 "기능리스트 예제 파일을 PDF로 변환하는 중 오류가 발생했습니다.",
@@ -440,8 +506,17 @@ class AIGenerationService:
                 detail="기능리스트 예제 파일을 PDF로 변환하는 중 오류가 발생했습니다.",
             ) from exc
 
-        pdf_bytes = AIGenerationService._rows_to_pdf(rows)
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _cached_feature_template_pdf(template_path_str: str) -> bytes:
+        template_path = Path(template_path_str)
+        content = template_path.read_bytes()
+        rows = AIGenerationService._parse_xlsx_rows(content)
+        return AIGenerationService._rows_to_pdf(rows)
 
+    @staticmethod
+    def _load_feature_template_pdf(menu_id: str, template_path: Path) -> BufferedUpload:
+        pdf_bytes = AIGenerationService._feature_template_pdf_bytes(menu_id, template_path)
         return BufferedUpload(
             name=template_path.with_suffix(".pdf").name,
             content=pdf_bytes,

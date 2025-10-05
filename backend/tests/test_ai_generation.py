@@ -208,3 +208,42 @@ async def test_generate_csv_normalizes_image_url_content(monkeypatch: pytest.Mon
         "image_url": "https://example.com/additional.png",
     } in image_parts
 
+
+def test_describe_builtin_attachments_reports_template_metadata() -> None:
+    attachments = AIGenerationService.describe_builtin_attachments("feature-list")
+    assert attachments, "기능리스트 메뉴에는 최소 한 개의 기본 첨부가 있어야 합니다."
+
+    template = attachments[0]
+    assert template.builtin is True
+    assert template.name.endswith(".pdf")
+    assert template.size_bytes is not None and template.size_bytes > 0
+    assert template.content_type == "application/pdf"
+
+
+def test_describe_builtin_attachments_empty_for_unknown_menu() -> None:
+    assert AIGenerationService.describe_builtin_attachments("unknown") == []
+
+
+def test_describe_prompt_preview_includes_descriptor_lines() -> None:
+    preview = AIGenerationService.describe_prompt_preview(
+        "feature-list", "요구사항 자료에서 주요 기능을 발췌하세요."
+    )
+
+    assert "요구사항 자료에서 주요 기능을 발췌하세요." in preview.user_prompt
+    assert preview.descriptor_lines, "기본 첨부 설명이 포함되어야 합니다."
+    assert any(
+        "기능리스트 예제 양식" in descriptor
+        for descriptor in preview.descriptor_lines
+    )
+    assert preview.closing_note is not None
+    assert "CSV" in preview.user_prompt
+
+
+def test_describe_prompt_preview_handles_unknown_menu() -> None:
+    preview = AIGenerationService.describe_prompt_preview("unknown", "테스트 지침")
+
+    assert preview.descriptor_lines == []
+    assert preview.closing_note is None
+    assert preview.user_prompt.endswith(
+        "CSV 이외의 다른 형식이나 설명 문장은 포함하지 마세요."
+    )
