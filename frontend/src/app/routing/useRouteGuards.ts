@@ -8,6 +8,19 @@ const PROJECTS_ROOT_PATH = '/projects'
 const LEGACY_DRIVE_PATH = '/drive'
 const PROMPT_ADMIN_PATH = '/admin/prompts/feature-list'
 
+function normalizePathname(pathname: string): string {
+  if (!pathname) {
+    return '/'
+  }
+
+  const [normalized] = pathname.split(/[?#]/)
+  if (!normalized) {
+    return '/'
+  }
+
+  return normalized.startsWith('/') ? normalized : `/${normalized}`
+}
+
 function isKnownPathname(pathname: string): boolean {
   if (
     pathname === '/' ||
@@ -21,26 +34,28 @@ function isKnownPathname(pathname: string): boolean {
 }
 
 export function useRouteGuards(pathname: string, authStatus: AuthStatus) {
-  useEffect(() => {
-    if (!isKnownPathname(pathname)) {
-      navigate('/', { replace: true })
-    }
-  }, [pathname])
+  const normalizedPathname = normalizePathname(pathname)
 
   useEffect(() => {
-    if (authStatus !== 'authenticated' && pathname !== '/') {
+    if (!isKnownPathname(normalizedPathname)) {
       navigate('/', { replace: true })
     }
-  }, [authStatus, pathname])
+  }, [normalizedPathname])
 
   useEffect(() => {
-    if (pathname === LEGACY_DRIVE_PATH) {
+    if (authStatus !== 'authenticated' && normalizedPathname !== '/') {
+      navigate('/', { replace: true })
+    }
+  }, [authStatus, normalizedPathname])
+
+  useEffect(() => {
+    if (normalizedPathname === LEGACY_DRIVE_PATH) {
       navigate(PROJECTS_ROOT_PATH, { replace: true })
       return
     }
 
-    if (authStatus === 'authenticated' && pathname === '/') {
+    if (authStatus === 'authenticated' && normalizedPathname === '/') {
       navigate(PROJECTS_ROOT_PATH, { replace: true })
     }
-  }, [authStatus, pathname])
+  }, [authStatus, normalizedPathname])
 }
