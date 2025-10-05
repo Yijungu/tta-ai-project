@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 
 import type { AuthStatus } from '../../auth'
 import { navigate } from '../../navigation'
+import { normalizePathname } from './normalizePathname'
 
 const PROJECT_PATH_PATTERN = /^\/projects\/(.+)$/
 const PROJECTS_ROOT_PATH = '/projects'
@@ -21,26 +22,28 @@ function isKnownPathname(pathname: string): boolean {
 }
 
 export function useRouteGuards(pathname: string, authStatus: AuthStatus) {
-  useEffect(() => {
-    if (!isKnownPathname(pathname)) {
-      navigate('/', { replace: true })
-    }
-  }, [pathname])
+  const normalizedPathname = normalizePathname(pathname)
 
   useEffect(() => {
-    if (authStatus !== 'authenticated' && pathname !== '/') {
+    if (!isKnownPathname(normalizedPathname)) {
       navigate('/', { replace: true })
     }
-  }, [authStatus, pathname])
+  }, [normalizedPathname])
 
   useEffect(() => {
-    if (pathname === LEGACY_DRIVE_PATH) {
+    if (authStatus !== 'authenticated' && normalizedPathname !== '/') {
+      navigate('/', { replace: true })
+    }
+  }, [authStatus, normalizedPathname])
+
+  useEffect(() => {
+    if (normalizedPathname === LEGACY_DRIVE_PATH) {
       navigate(PROJECTS_ROOT_PATH, { replace: true })
       return
     }
 
-    if (authStatus === 'authenticated' && pathname === '/') {
+    if (authStatus === 'authenticated' && normalizedPathname === '/') {
       navigate(PROJECTS_ROOT_PATH, { replace: true })
     }
-  }, [authStatus, pathname])
+  }, [authStatus, normalizedPathname])
 }
