@@ -1,5 +1,12 @@
 import type { PropsWithChildren } from 'react'
 
-export function PageLayout({ children }: PropsWithChildren) {
-  return <div className="page">{children}</div>
+interface PageLayoutProps {
+  variant?: 'default' | 'wide'
+  className?: string
+}
+
+export function PageLayout({ children, variant = 'default', className }: PropsWithChildren<PageLayoutProps>) {
+  const classes = ['page', variant === 'wide' ? 'page--wide' : '', className].filter(Boolean).join(' ')
+
+  return <div className={classes}>{children}</div>
 }
