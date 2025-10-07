@@ -165,6 +165,10 @@
   gap: 2.5rem;
 }
 
+.page.page--wide {
+  width: min(1280px, 100%);
+}
+
 .page__header {
   display: flex;
   flex-direction: column;
