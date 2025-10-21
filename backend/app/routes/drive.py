@@ -23,10 +23,11 @@ from ..services.google_drive import GoogleDriveService
 from ..services.security_report import SecurityReportService
 from ..services.excel_templates import (
     DefectReportImage,
+    FEATURE_LIST_EXPECTED_HEADERS,
     populate_defect_report,
     populate_feature_list,
     populate_testcase_list,
-    DEFECT_REPORT_EXPECTED_HEADERS
+    DEFECT_REPORT_EXPECTED_HEADERS,
 )
 
 router = APIRouter()
@@ -54,6 +55,46 @@ class DefectCellRewriteRequest(BaseModel):
     )
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+class FeatureListRowPayload(BaseModel):
+    overview: str = Field("", description="기능 개요")
+    major_category: str = Field("", alias="majorCategory", description="대분류")
+    middle_category: str = Field("", alias="middleCategory", description="중분류")
+    minor_category: str = Field("", alias="minorCategory", description="소분류")
+    detail: str = Field("", description="상세 내용")
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    def to_record(self) -> Dict[str, str]:
+        return {
+            "개요": self.overview.strip(),
+            "대분류": self.major_category.strip(),
+            "중분류": self.middle_category.strip(),
+            "소분류": self.minor_category.strip(),
+            "상세 내용": self.detail.strip(),
+        }
+
+
+class FeatureListUpdateRequest(BaseModel):
+    rows: List[FeatureListRowPayload] = Field(default_factory=list, description="업데이트할 기능 리스트 행")
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+def _serialize_feature_rows(records: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    serialized: List[Dict[str, str]] = []
+    for record in records:
+        serialized.append(
+            {
+                "overview": str(record.get("개요", "")),
+                "majorCategory": str(record.get("대분류", "")),
+                "middleCategory": str(record.get("중분류", "")),
+                "minorCategory": str(record.get("소분류", "")),
+                "detail": str(record.get("상세 내용", "")),
+            }
+        )
+    return serialized
 
 
 _REQUIRED_MENU_DOCUMENTS: Dict[str, List[RequiredDocument]] = {
@@ -463,6 +504,71 @@ async def generate_project_asset(
     }
 
     return StreamingResponse(io.BytesIO(result.content), media_type="text/csv", headers=headers)
+
+
+@router.get("/drive/projects/{project_id}/feature-list/rows")
+async def read_feature_list_rows(
+    project_id: str,
+    google_id: Optional[str] = Query(None, description="Drive 작업에 사용할 Google 사용자 식별자 (sub)"),
+    drive_service: GoogleDriveService = Depends(get_drive_service),
+) -> Dict[str, Any]:
+    rows, file_name = await drive_service.get_feature_list_rows(
+        project_id=project_id,
+        google_id=google_id,
+    )
+    return {"rows": _serialize_feature_rows(rows), "fileName": file_name}
+
+
+@router.put("/drive/projects/{project_id}/feature-list/rows")
+async def update_feature_list_rows(
+    project_id: str,
+    payload: FeatureListUpdateRequest,
+    google_id: Optional[str] = Query(None, description="Drive 작업에 사용할 Google 사용자 식별자 (sub)"),
+    drive_service: GoogleDriveService = Depends(get_drive_service),
+) -> Dict[str, Any]:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=FEATURE_LIST_EXPECTED_HEADERS)
+    writer.writeheader()
+    for row in payload.rows:
+        writer.writerow(row.to_record())
+    csv_text = buffer.getvalue()
+
+    await drive_service.apply_csv_to_spreadsheet(
+        project_id=project_id,
+        menu_id="feature-list",
+        csv_text=csv_text,
+        google_id=google_id,
+    )
+
+    rows, file_name = await drive_service.get_feature_list_rows(
+        project_id=project_id,
+        google_id=google_id,
+    )
+    return {"rows": _serialize_feature_rows(rows), "fileName": file_name}
+
+
+@router.get("/drive/projects/{project_id}/feature-list/download")
+async def download_feature_list_file(
+    project_id: str,
+    google_id: Optional[str] = Query(None, description="Drive 작업에 사용할 Google 사용자 식별자 (sub)"),
+    drive_service: GoogleDriveService = Depends(get_drive_service),
+) -> StreamingResponse:
+    workbook_bytes, file_name = await drive_service.fetch_project_spreadsheet(
+        project_id=project_id,
+        menu_id="feature-list",
+        google_id=google_id,
+    )
+
+    headers = {
+        "Content-Disposition": _build_attachment_header(file_name),
+        "Cache-Control": "no-store",
+    }
+
+    return StreamingResponse(
+        io.BytesIO(workbook_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
 
 
 @router.post("/drive/projects/{project_id}/defect-report/rewrite")

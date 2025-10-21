@@ -19,6 +19,7 @@ from openpyxl import Workbook
 from ..config import Settings
 from ..token_store import StoredTokens, TokenStorage
 from .excel_templates import (
+    extract_feature_list_records,
     populate_defect_report,
     populate_feature_list,
     populate_security_report,
@@ -432,6 +433,42 @@ class GoogleDriveService:
 
         raise HTTPException(status_code=401, detail="Google Drive 인증이 만료되었습니다. 다시 로그인해주세요.")
 
+    async def _resolve_spreadsheet_file(
+        self,
+        tokens: StoredTokens,
+        *,
+        project_id: str,
+        menu_id: str,
+    ) -> tuple[_SpreadsheetRule, Dict[str, Any], StoredTokens]:
+        rule = _SPREADSHEET_RULES.get(menu_id)
+        if not rule:
+            raise HTTPException(status_code=404, detail="지원하지 않는 생성 메뉴입니다.")
+
+        folder, tokens = await self._find_child_folder_by_name(
+            tokens,
+            parent_id=project_id,
+            name=rule["folder_name"],
+        )
+        if folder is None or not folder.get("id"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"프로젝트에 '{rule['folder_name']}' 폴더를 찾을 수 없습니다.",
+            )
+
+        file_entry, tokens = await self._find_file_by_suffix(
+            tokens,
+            parent_id=str(folder["id"]),
+            suffix=rule["file_suffix"],
+            mime_type=XLSX_MIME_TYPE,
+        )
+        if file_entry is None or not file_entry.get("id"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"프로젝트에 '{rule['file_suffix']}' 파일을 찾을 수 없습니다.",
+            )
+
+        return rule, file_entry, tokens
+
     async def _find_root_folder(
         self, tokens: StoredTokens, *, folder_name: str
     ) -> Tuple[Optional[Dict[str, Any]], StoredTokens]:
@@ -679,26 +716,14 @@ class GoogleDriveService:
         stored_tokens = self._load_tokens(google_id)
         active_tokens = await self._ensure_valid_tokens(stored_tokens)
 
-        folder, active_tokens = await self._find_child_folder_by_name(
+        _, file_entry, active_tokens = await self._resolve_spreadsheet_file(
             active_tokens,
-            parent_id=project_id,
-            name=rule["folder_name"],
+            project_id=project_id,
+            menu_id=menu_id,
         )
-        if folder is None or not folder.get("id"):
-            raise HTTPException(status_code=404, detail=f"프로젝트에 '{rule['folder_name']}' 폴더를 찾을 수 없습니다.")
-
-        folder_id = str(folder["id"])
-        file_entry, active_tokens = await self._find_file_by_suffix(
-            active_tokens,
-            parent_id=folder_id,
-            suffix=rule["file_suffix"],
-            mime_type=XLSX_MIME_TYPE,
-        )
-        if file_entry is None or not file_entry.get("id"):
-            raise HTTPException(status_code=404, detail=f"프로젝트에 '{rule['file_suffix']}' 파일을 찾을 수 없습니다.")
 
         file_id = str(file_entry["id"])
-        file_name = str(file_entry.get("name", rule["file_suffix"]))
+        file_name = str(file_entry.get("name") or rule["file_suffix"])
 
         workbook_bytes, active_tokens = await self._download_file_content(
             active_tokens,
@@ -726,6 +751,52 @@ class GoogleDriveService:
         logger.info(
             "Populated project spreadsheet", extra={"project_id": project_id, "menu_id": menu_id, "file_id": file_id}
         )
+
+    async def fetch_project_spreadsheet(
+        self,
+        *,
+        project_id: str,
+        menu_id: str,
+        google_id: Optional[str],
+    ) -> tuple[bytes, str]:
+        self._oauth_service.ensure_credentials()
+        stored_tokens = self._load_tokens(google_id)
+        active_tokens = await self._ensure_valid_tokens(stored_tokens)
+
+        rule, file_entry, active_tokens = await self._resolve_spreadsheet_file(
+            active_tokens,
+            project_id=project_id,
+            menu_id=menu_id,
+        )
+
+        file_id = str(file_entry["id"])
+        workbook_bytes, _ = await self._download_file_content(
+            active_tokens,
+            file_id=file_id,
+            mime_type=file_entry.get("mimeType"),
+        )
+
+        file_name = str(file_entry.get("name") or rule["file_suffix"])
+        return workbook_bytes, file_name
+
+    async def get_feature_list_rows(
+        self,
+        *,
+        project_id: str,
+        google_id: Optional[str],
+    ) -> tuple[List[Dict[str, str]], str]:
+        workbook_bytes, file_name = await self.fetch_project_spreadsheet(
+            project_id=project_id,
+            menu_id="feature-list",
+            google_id=google_id,
+        )
+
+        try:
+            rows = extract_feature_list_records(workbook_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        return rows, file_name
 
     async def get_project_exam_number(
         self,

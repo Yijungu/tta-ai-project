@@ -48,6 +48,28 @@ type GenerationStatus = 'idle' | 'loading' | 'success' | 'error'
 
 const IMAGE_FILE_TYPES = new Set<FileType>(['jpg', 'png'])
 
+interface FeatureListRow {
+  overview: string
+  majorCategory: string
+  middleCategory: string
+  minorCategory: string
+  detail: string
+}
+
+type FeatureListEditorStatus = 'idle' | 'loading' | 'ready' | 'error'
+
+interface FeatureListEditorState {
+  status: FeatureListEditorStatus
+  rows: FeatureListRow[]
+  fileName: string | null
+  error: string | null
+  isSaving: boolean
+  saveError: string | null
+  hasUnsavedChanges: boolean
+  isDownloading: boolean
+  downloadError: string | null
+}
+
 interface ItemState {
   files: File[]
   requiredFiles: Record<string, File[]>
@@ -108,6 +130,78 @@ function parseFileNameFromDisposition(disposition: string | null): string | null
 
 function sanitizeFileName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, '_')
+}
+
+function createInitialFeatureListEditorState(): FeatureListEditorState {
+  return {
+    status: 'idle',
+    rows: [],
+    fileName: null,
+    error: null,
+    isSaving: false,
+    saveError: null,
+    hasUnsavedChanges: false,
+    isDownloading: false,
+    downloadError: null,
+  }
+}
+
+function normalizeFeatureListValue(value: unknown): string {
+  if (typeof value === 'string') {
+    return value
+  }
+  if (value === null || value === undefined) {
+    return ''
+  }
+  return String(value)
+}
+
+function normalizeFeatureListRows(input: unknown): FeatureListRow[] {
+  if (!Array.isArray(input)) {
+    return []
+  }
+  return input.map((entry) => {
+    if (entry && typeof entry === 'object') {
+      const record = entry as Record<string, unknown>
+      return {
+        overview: normalizeFeatureListValue(record.overview),
+        majorCategory: normalizeFeatureListValue(record.majorCategory),
+        middleCategory: normalizeFeatureListValue(record.middleCategory),
+        minorCategory: normalizeFeatureListValue(record.minorCategory),
+        detail: normalizeFeatureListValue(record.detail),
+      }
+    }
+
+    return {
+      overview: '',
+      majorCategory: '',
+      middleCategory: '',
+      minorCategory: '',
+      detail: '',
+    }
+  })
+}
+
+async function extractErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const data = (await response.clone().json()) as { detail?: unknown }
+    if (data && typeof data.detail === 'string' && data.detail.trim()) {
+      return data.detail
+    }
+  } catch {
+    // ignore JSON parsing errors
+  }
+
+  try {
+    const text = await response.clone().text()
+    if (text && text.trim()) {
+      return text
+    }
+  } catch {
+    // ignore text parsing errors
+  }
+
+  return fallback
 }
 
 const XLSX_RESULT_MENUS: Set<MenuItemId> = new Set([
@@ -234,6 +328,9 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
   const backendUrl = useMemo(() => getBackendUrl(), [])
   const [activeItem, setActiveItem] = useState<MenuItemId>(FIRST_MENU_ITEM)
   const [itemStates, setItemStates] = useState<Record<MenuItemId, ItemState>>(() => createInitialItemStates())
+  const [featureListEditor, setFeatureListEditor] = useState<FeatureListEditorState>(() =>
+    createInitialFeatureListEditorState(),
+  )
   const controllersRef = useRef<Record<MenuItemId, AbortController | null>>(
     Object.fromEntries(MENU_ITEM_IDS.map((id) => [id, null])) as Record<MenuItemId, AbortController | null>,
   )
@@ -257,7 +354,235 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
     downloadUrlsRef.current[id] = null
   }, [])
 
+  const resetFeatureListEditor = useCallback(() => {
+    setFeatureListEditor(createInitialFeatureListEditorState())
+  }, [])
+
+  const loadFeatureListRows = useCallback(async () => {
+    setFeatureListEditor((prev) => ({
+      ...prev,
+      status: 'loading',
+      error: null,
+      saveError: null,
+      downloadError: null,
+    }))
+
+    try {
+      const response = await fetch(
+        `${backendUrl}/drive/projects/${encodeURIComponent(projectId)}/feature-list/rows`,
+      )
+      if (!response.ok) {
+        const message = await extractErrorMessage(
+          response,
+          '기능리스트를 불러오는 중 오류가 발생했습니다.',
+        )
+        throw new Error(message)
+      }
+
+      const data = (await response.json()) as { rows?: unknown; fileName?: unknown }
+      const normalizedRows = normalizeFeatureListRows(data?.rows)
+      const fileName =
+        typeof data?.fileName === 'string' && data.fileName.trim() ? data.fileName : null
+
+      setFeatureListEditor({
+        status: 'ready',
+        rows: normalizedRows,
+        fileName,
+        error: null,
+        isSaving: false,
+        saveError: null,
+        hasUnsavedChanges: false,
+        isDownloading: false,
+        downloadError: null,
+      })
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : '기능리스트를 불러오는 중 오류가 발생했습니다.'
+      setFeatureListEditor((prev) => ({
+        ...prev,
+        status: 'error',
+        error: message,
+        isSaving: false,
+        isDownloading: false,
+      }))
+    }
+  }, [backendUrl, projectId])
+
+  const handleFeatureListRowChange = useCallback(
+    (index: number, key: keyof FeatureListRow, value: string) => {
+      setFeatureListEditor((prev) => {
+        if (prev.status !== 'ready') {
+          return prev
+        }
+        if (index < 0 || index >= prev.rows.length) {
+          return prev
+        }
+        const nextRows = prev.rows.map((row, rowIndex) =>
+          rowIndex === index ? { ...row, [key]: value } : row,
+        )
+        return {
+          ...prev,
+          rows: nextRows,
+          hasUnsavedChanges: true,
+          saveError: null,
+        }
+      })
+    },
+    [],
+  )
+
+  const handleAddFeatureListRow = useCallback(() => {
+    setFeatureListEditor((prev) => {
+      if (prev.status !== 'ready') {
+        return prev
+      }
+      return {
+        ...prev,
+        rows: [
+          ...prev.rows,
+          { overview: '', majorCategory: '', middleCategory: '', minorCategory: '', detail: '' },
+        ],
+        hasUnsavedChanges: true,
+        saveError: null,
+      }
+    })
+  }, [])
+
+  const handleRemoveFeatureListRow = useCallback((index: number) => {
+    setFeatureListEditor((prev) => {
+      if (prev.status !== 'ready') {
+        return prev
+      }
+      if (index < 0 || index >= prev.rows.length) {
+        return prev
+      }
+      const nextRows = prev.rows.filter((_, rowIndex) => rowIndex !== index)
+      return {
+        ...prev,
+        rows: nextRows,
+        hasUnsavedChanges: true,
+        saveError: null,
+      }
+    })
+  }, [])
+
+  const handleSaveFeatureList = useCallback(async () => {
+    if (featureListEditor.status !== 'ready' || featureListEditor.isSaving) {
+      return
+    }
+
+    setFeatureListEditor((prev) => ({ ...prev, isSaving: true, saveError: null }))
+
+    try {
+      const response = await fetch(
+        `${backendUrl}/drive/projects/${encodeURIComponent(projectId)}/feature-list/rows`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rows: featureListEditor.rows }),
+        },
+      )
+
+      if (!response.ok) {
+        const message = await extractErrorMessage(
+          response,
+          '기능리스트를 저장하는 중 오류가 발생했습니다.',
+        )
+        throw new Error(message)
+      }
+
+      const data = (await response.json()) as { rows?: unknown; fileName?: unknown }
+      const normalizedRows = normalizeFeatureListRows(data?.rows)
+      const fileName =
+        typeof data?.fileName === 'string' && data.fileName.trim() ? data.fileName : featureListEditor.fileName
+
+      setFeatureListEditor({
+        status: 'ready',
+        rows: normalizedRows,
+        fileName,
+        error: null,
+        isSaving: false,
+        saveError: null,
+        hasUnsavedChanges: false,
+        isDownloading: false,
+        downloadError: null,
+      })
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : '기능리스트를 저장하는 중 오류가 발생했습니다.'
+      setFeatureListEditor((prev) => ({
+        ...prev,
+        isSaving: false,
+        saveError: message,
+      }))
+    }
+  }, [backendUrl, featureListEditor.fileName, featureListEditor.isSaving, featureListEditor.rows, featureListEditor.status, projectId])
+
+  const handleFeatureListDownload = useCallback(async () => {
+    if (featureListEditor.isDownloading) {
+      return
+    }
+
+    setFeatureListEditor((prev) => ({ ...prev, isDownloading: true, downloadError: null }))
+
+    try {
+      const response = await fetch(
+        `${backendUrl}/drive/projects/${encodeURIComponent(projectId)}/feature-list/download`,
+      )
+      if (!response.ok) {
+        const message = await extractErrorMessage(
+          response,
+          '기능리스트를 다운로드하는 중 오류가 발생했습니다.',
+        )
+        throw new Error(message)
+      }
+
+      const blob = await response.blob()
+      const disposition = response.headers.get('content-disposition')
+      const parsedName = parseFileNameFromDisposition(disposition)
+      const fallbackName = featureListEditor.fileName ?? 'feature-list.xlsx'
+      const safeName = sanitizeFileName(parsedName ?? fallbackName)
+
+      const objectUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = objectUrl
+      anchor.download = safeName
+      document.body.appendChild(anchor)
+      anchor.click()
+      document.body.removeChild(anchor)
+      window.setTimeout(() => {
+        URL.revokeObjectURL(objectUrl)
+      }, 1000)
+
+      setFeatureListEditor((prev) => ({
+        ...prev,
+        isDownloading: false,
+        downloadError: null,
+        fileName: safeName,
+      }))
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : '기능리스트를 다운로드하는 중 오류가 발생했습니다.'
+      setFeatureListEditor((prev) => ({
+        ...prev,
+        isDownloading: false,
+        downloadError: message,
+      }))
+    }
+  }, [backendUrl, featureListEditor.fileName, featureListEditor.isDownloading, projectId])
+
+  const handleReloadFeatureList = useCallback(() => {
+    loadFeatureListRows()
+  }, [loadFeatureListRows])
+
   const activeContent = MENU_ITEMS.find((item) => item.id === activeItem) ?? MENU_ITEMS[0]
+  const isFeatureList = activeContent.id === 'feature-list'
   const isDefectReport = activeContent.id === 'defect-report'
 
   const activeState = itemStates[activeContent.id] ?? createItemState(activeContent)
@@ -272,8 +597,35 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
     }
   }, [isDefectReport, isDefectPreviewVisible])
 
+  useEffect(() => {
+    if (!isFeatureList) {
+      if (featureListEditor.status !== 'idle') {
+        resetFeatureListEditor()
+      }
+      return
+    }
+
+    if (activeState.status === 'success') {
+      if (featureListEditor.status === 'idle') {
+        loadFeatureListRows()
+      }
+    } else if (featureListEditor.status !== 'idle') {
+      resetFeatureListEditor()
+    }
+  }, [
+    activeState.status,
+    featureListEditor.status,
+    isFeatureList,
+    loadFeatureListRows,
+    resetFeatureListEditor,
+  ])
+
   const handleChangeFiles = useCallback(
     (id: MenuItemId, nextFiles: File[]) => {
+      if (id === 'feature-list') {
+        resetFeatureListEditor()
+      }
+
       setItemStates((prev) => {
         const current = prev[id]
         if (!current || current.status === 'loading') {
@@ -302,6 +654,10 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
 
   const handleSetRequiredFiles = useCallback(
     (id: MenuItemId, docId: string, nextFiles: File[]) => {
+      if (id === 'feature-list') {
+        resetFeatureListEditor()
+      }
+
       setItemStates((prev) => {
         const current = prev[id]
         if (!current || current.status === 'loading') {
@@ -339,6 +695,10 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
     (id: MenuItemId, selectedFiles: File[]) => {
       if (selectedFiles.length === 0) {
         return
+      }
+
+      if (id === 'feature-list') {
+        resetFeatureListEditor()
       }
 
       setItemStates((prev) => {
@@ -402,6 +762,10 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
 
   const handleRemoveAdditionalFile = useCallback(
     (id: MenuItemId, entryId: string) => {
+      if (id === 'feature-list') {
+        resetFeatureListEditor()
+      }
+
       setItemStates((prev) => {
         const current = prev[id]
         if (!current || current.status === 'loading') {
@@ -439,6 +803,10 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
       const menu = menuById[id] ?? MENU_ITEMS[0]
       if (!current || current.status === 'loading') {
         return
+      }
+
+      if (id === 'feature-list') {
+        resetFeatureListEditor()
       }
 
       const requiredDocs = menu?.requiredDocuments ?? []
@@ -591,7 +959,8 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
         }
 
         const safeName = sanitizeFileName(effectiveName)
-        const objectUrl = URL.createObjectURL(blob)
+        const shouldCreateDownloadUrl = id !== 'feature-list'
+        const objectUrl = shouldCreateDownloadUrl ? URL.createObjectURL(blob) : null
 
         setItemStates((prev) => {
           const previous = prev[id]
@@ -600,18 +969,28 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
           }
 
           const baseState = createItemState(menu)
+          const nextState: ItemState = {
+            ...baseState,
+            status: 'success',
+            downloadUrl: objectUrl,
+            downloadName: safeName,
+          }
+
+          if (!shouldCreateDownloadUrl) {
+            nextState.downloadUrl = null
+            nextState.downloadName = safeName
+          }
 
           return {
             ...prev,
-            [id]: {
-              ...baseState,
-              status: 'success',
-              downloadUrl: objectUrl,
-              downloadName: safeName,
-            },
+            [id]: nextState,
           }
         })
-        downloadUrlsRef.current[id] = objectUrl
+        if (shouldCreateDownloadUrl) {
+          downloadUrlsRef.current[id] = objectUrl
+        } else {
+          downloadUrlsRef.current[id] = null
+        }
       } catch (error) {
         if (controller.signal.aborted) {
           return
@@ -636,13 +1015,17 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
         }
       }
     },
-    [backendUrl, itemStates, menuById, projectId, releaseDownloadUrl],
+    [backendUrl, itemStates, menuById, projectId, releaseDownloadUrl, resetFeatureListEditor],
   )
 
   const handleReset = useCallback(
     (id: MenuItemId) => {
       controllersRef.current[id]?.abort()
       controllersRef.current[id] = null
+
+      if (id === 'feature-list') {
+        resetFeatureListEditor()
+      }
 
       setItemStates((prev) => {
         const current = prev[id]
@@ -846,23 +1229,19 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
             )
           )}
 
-          {!isDefectReport && (
+          {!isDefectReport && activeState.status !== 'success' && (
             <div className="project-management-content__actions">
-              {activeState.status !== 'success' && (
-                <>
-                  <button
-                    type="button"
-                    className="project-management-content__button"
-                    onClick={() => handleGenerate(activeContent.id)}
-                    disabled={activeState.status === 'loading'}
-                  >
-                    {activeState.status === 'loading' ? '생성 중…' : activeContent.buttonLabel}
-                  </button>
-                  <p className="project-management-content__footnote">
-                    업로드된 문서는 프로젝트 드라이브에 안전하게 보관되며, 생성된 결과는 별도의 탭에서 확인할 수 있습니다.
-                  </p>
-                </>
-              )}
+              <button
+                type="button"
+                className="project-management-content__button"
+                onClick={() => handleGenerate(activeContent.id)}
+                disabled={activeState.status === 'loading'}
+              >
+                {activeState.status === 'loading' ? '생성 중…' : activeContent.buttonLabel}
+              </button>
+              <p className="project-management-content__footnote">
+                업로드된 문서는 프로젝트 드라이브에 안전하게 보관되며, 생성된 결과는 별도의 탭에서 확인할 수 있습니다.
+              </p>
 
               {activeState.status === 'loading' && (
                 <div
@@ -878,8 +1257,196 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
                   {activeState.errorMessage}
                 </div>
               )}
+            </div>
+          )}
 
-              {activeState.status === 'success' && (
+          {!isDefectReport && activeState.status === 'success' && (
+            isFeatureList ? (
+              <section className="feature-editor project-management-content__section">
+                <div className="feature-editor__header">
+                  <h2 className="feature-editor__title">기능리스트 검토 및 수정</h2>
+                  <p className="feature-editor__description">
+                    GS 템플릿 형식으로 채운 내용을 확인하고 필요한 항목을 직접 수정한 뒤 저장하세요.
+                  </p>
+                </div>
+
+                {featureListEditor.status === 'loading' && (
+                  <div className="feature-editor__status" role="status">
+                    기능리스트를 불러오는 중입니다…
+                  </div>
+                )}
+
+                {featureListEditor.status === 'error' && (
+                  <div className="feature-editor__status feature-editor__status--error" role="alert">
+                    {featureListEditor.error ?? '기능리스트를 불러오는 중 오류가 발생했습니다.'}
+                    <button
+                      type="button"
+                      className="feature-editor__retry"
+                      onClick={handleReloadFeatureList}
+                    >
+                      다시 불러오기
+                    </button>
+                  </div>
+                )}
+
+                {featureListEditor.status === 'ready' && (
+                  <>
+                    <div className="feature-editor__meta">
+                      {featureListEditor.fileName && (
+                        <span className="feature-editor__filename">파일명: {featureListEditor.fileName}</span>
+                      )}
+                      {featureListEditor.hasUnsavedChanges && (
+                        <span className="feature-editor__unsaved" role="status">
+                          저장되지 않은 변경 사항이 있습니다.
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="feature-editor__table-wrapper">
+                      {featureListEditor.rows.length === 0 ? (
+                        <div className="feature-editor__empty" role="status">
+                          등록된 행이 없습니다. 아래의 행 추가 버튼을 눌러 항목을 작성해 주세요.
+                        </div>
+                      ) : (
+                        <table className="feature-editor__table">
+                          <thead>
+                            <tr>
+                              <th scope="col">개요</th>
+                              <th scope="col">대분류</th>
+                              <th scope="col">중분류</th>
+                              <th scope="col">소분류</th>
+                              <th scope="col">상세 내용</th>
+                              <th scope="col" className="feature-editor__actions-header">
+                                작업
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {featureListEditor.rows.map((row, rowIndex) => (
+                              <tr key={`feature-row-${rowIndex}`}>
+                                <td>
+                                  <input
+                                    type="text"
+                                    value={row.overview}
+                                    onChange={(event) =>
+                                      handleFeatureListRowChange(rowIndex, 'overview', event.target.value)
+                                    }
+                                  />
+                                </td>
+                                <td>
+                                  <input
+                                    type="text"
+                                    value={row.majorCategory}
+                                    onChange={(event) =>
+                                      handleFeatureListRowChange(rowIndex, 'majorCategory', event.target.value)
+                                    }
+                                  />
+                                </td>
+                                <td>
+                                  <input
+                                    type="text"
+                                    value={row.middleCategory}
+                                    onChange={(event) =>
+                                      handleFeatureListRowChange(rowIndex, 'middleCategory', event.target.value)
+                                    }
+                                  />
+                                </td>
+                                <td>
+                                  <input
+                                    type="text"
+                                    value={row.minorCategory}
+                                    onChange={(event) =>
+                                      handleFeatureListRowChange(rowIndex, 'minorCategory', event.target.value)
+                                    }
+                                  />
+                                </td>
+                                <td>
+                                  <textarea
+                                    value={row.detail}
+                                    onChange={(event) =>
+                                      handleFeatureListRowChange(rowIndex, 'detail', event.target.value)
+                                    }
+                                  />
+                                </td>
+                                <td className="feature-editor__row-actions">
+                                  <button
+                                    type="button"
+                                    className="feature-editor__remove"
+                                    onClick={() => handleRemoveFeatureListRow(rowIndex)}
+                                  >
+                                    삭제
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+
+                    <div className="feature-editor__controls">
+                      <button
+                        type="button"
+                        className="feature-editor__add"
+                        onClick={handleAddFeatureListRow}
+                      >
+                        행 추가
+                      </button>
+                    </div>
+
+                    <div className="feature-editor__actions">
+                      <button
+                        type="button"
+                        className="project-management-content__button"
+                        onClick={handleSaveFeatureList}
+                        disabled={
+                          featureListEditor.status !== 'ready' ||
+                          featureListEditor.isSaving ||
+                          !featureListEditor.hasUnsavedChanges
+                        }
+                      >
+                        {featureListEditor.isSaving ? '저장 중…' : '수정 완료'}
+                      </button>
+                      <button
+                        type="button"
+                        className="project-management-content__button project-management-content__download"
+                        onClick={handleFeatureListDownload}
+                        disabled={
+                          featureListEditor.status !== 'ready' ||
+                          featureListEditor.isDownloading ||
+                          featureListEditor.hasUnsavedChanges
+                        }
+                      >
+                        {featureListEditor.isDownloading ? '다운로드 준비 중…' : '다운로드'}
+                      </button>
+                      <button
+                        type="button"
+                        className="project-management-content__secondary"
+                        onClick={() => handleReset(activeContent.id)}
+                      >
+                        다시 생성하기
+                      </button>
+                    </div>
+
+                    {featureListEditor.saveError && (
+                      <div className="feature-editor__status feature-editor__status--error" role="alert">
+                        {featureListEditor.saveError}
+                      </div>
+                    )}
+                    {featureListEditor.downloadError && (
+                      <div className="feature-editor__status feature-editor__status--error" role="alert">
+                        {featureListEditor.downloadError}
+                      </div>
+                    )}
+
+                    <p className="feature-editor__footnote">
+                      저장된 내용은 프로젝트 드라이브의 기능리스트 템플릿에도 즉시 반영되며, 다운로드 버튼을 누르면 최신 파일을 받을 수 있습니다.
+                    </p>
+                  </>
+                )}
+              </section>
+            ) : (
+              <div className="project-management-content__actions">
                 <div className="project-management-content__result">
                   <a
                     href={activeState.downloadUrl ?? undefined}
@@ -899,8 +1466,8 @@ export function ProjectManagementPage({ projectId }: ProjectManagementPageProps)
                     생성된 결과는 프로젝트 드라이브에도 저장되며 필요 시 언제든지 다시 다운로드할 수 있습니다.
                   </p>
                 </div>
-              )}
-            </div>
+              </div>
+            )
           )}
         </div>
       </main>

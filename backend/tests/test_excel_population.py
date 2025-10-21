@@ -17,6 +17,7 @@ from app.services.excel_templates import (
     FEATURE_LIST_EXPECTED_HEADERS,
     SECURITY_REPORT_EXPECTED_HEADERS,
     TESTCASE_EXPECTED_HEADERS,
+    extract_feature_list_records,
     populate_feature_list,
     populate_security_report,
     populate_testcase_list,
@@ -56,21 +57,47 @@ def test_populate_feature_list_inserts_rows() -> None:
     csv_text = "\n".join(
         [
             ",".join(FEATURE_LIST_EXPECTED_HEADERS),
-            "대1,중1,소1",
-            "대2,중2,소2",
+            "개요1,대1,중1,소1,상세1",
+            "개요2,대2,중2,소2,상세2",
         ]
     )
 
     updated = populate_feature_list(template_bytes, csv_text)
     root = _load_sheet(updated)
 
-    assert _cell_text(root, "A8") == "대1"
-    assert _cell_text(root, "B8") == "중1"
-    assert _cell_text(root, "C8") == "소1"
-    assert _cell_text(root, "A9") == "대2"
-    assert _cell_text(root, "B9") == "중2"
-    assert _cell_text(root, "C9") == "소2"
+    assert _cell_text(root, "A8") == "개요1"
+    assert _cell_text(root, "B8") == "대1"
+    assert _cell_text(root, "C8") == "중1"
+    assert _cell_text(root, "D8") == "소1"
+    assert _cell_text(root, "E8") == "상세1"
+    assert _cell_text(root, "A9") == "개요2"
+    assert _cell_text(root, "B9") == "대2"
+    assert _cell_text(root, "C9") == "중2"
+    assert _cell_text(root, "D9") == "소2"
+    assert _cell_text(root, "E9") == "상세2"
     assert _cell_text(root, "A10") is None
+
+
+def test_extract_feature_list_records_returns_rows() -> None:
+    template_path = Path("backend/template/가.계획/GS-B-XX-XXXX 기능리스트 v1.0.xlsx")
+    template_bytes = template_path.read_bytes()
+
+    csv_text = "\n".join(
+        [
+            ",".join(FEATURE_LIST_EXPECTED_HEADERS),
+            "개요1,대1,중1,소1,상세1",
+            " , , , , ",
+            "개요2,대2,중2,소2,상세2",
+        ]
+    )
+
+    updated = populate_feature_list(template_bytes, csv_text)
+    records = extract_feature_list_records(updated)
+
+    assert records == [
+        {"개요": "개요1", "대분류": "대1", "중분류": "중1", "소분류": "소1", "상세 내용": "상세1"},
+        {"개요": "개요2", "대분류": "대2", "중분류": "중2", "소분류": "소2", "상세 내용": "상세2"},
+    ]
 
 
 def test_populate_testcase_list_maps_columns() -> None:
