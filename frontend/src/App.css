@@ -1623,6 +1623,277 @@
   box-shadow: 0 10px 20px rgba(148, 163, 184, 0.24);
 }
 
+.feature-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  padding: 1.75rem;
+  border-radius: 18px;
+  border: 1px solid #e2e8f0;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow:
+    0 18px 36px rgba(15, 23, 42, 0.08),
+    0 4px 16px rgba(15, 23, 42, 0.05);
+}
+
+.feature-editor__header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.feature-editor__title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.feature-editor__description {
+  margin: 0;
+  font-size: 0.98rem;
+  line-height: 1.65;
+  color: #475569;
+}
+
+.feature-editor__status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.95rem 1.1rem;
+  border-radius: 12px;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  background: rgba(59, 130, 246, 0.08);
+  color: #1d4ed8;
+  font-weight: 600;
+}
+
+.feature-editor__status--error {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(254, 226, 226, 0.55);
+  color: #b91c1c;
+}
+
+.feature-editor__retry {
+  padding: 0.35rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  background: rgba(59, 130, 246, 0.12);
+  color: #1d4ed8;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.feature-editor__retry:hover,
+.feature-editor__retry:focus-visible {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(59, 130, 246, 0.65);
+  color: #1e3a8a;
+  box-shadow: 0 8px 18px rgba(59, 130, 246, 0.18);
+}
+
+.feature-editor__retry:focus-visible {
+  outline: 2px solid rgba(59, 130, 246, 0.35);
+  outline-offset: 2px;
+}
+
+.feature-editor__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  align-items: center;
+  font-size: 0.92rem;
+  color: #475569;
+}
+
+.feature-editor__filename {
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(226, 232, 240, 0.6);
+  color: #1e293b;
+  font-weight: 600;
+}
+
+.feature-editor__unsaved {
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(253, 230, 138, 0.45);
+  color: #b45309;
+  font-weight: 600;
+}
+
+.feature-editor__table-wrapper {
+  overflow-x: auto;
+  border-radius: 14px;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+}
+
+.feature-editor__table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+  background: #ffffff;
+}
+
+.feature-editor__table thead {
+  background: rgba(241, 245, 249, 0.75);
+}
+
+.feature-editor__table th,
+.feature-editor__table td {
+  padding: 0.75rem 0.85rem;
+  text-align: left;
+  border-bottom: 1px solid #e2e8f0;
+  vertical-align: top;
+  font-size: 0.95rem;
+  color: #1e293b;
+}
+
+.feature-editor__table th {
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.feature-editor__table tr:last-child td {
+  border-bottom: none;
+}
+
+.feature-editor__table input,
+.feature-editor__table textarea {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  background: rgba(248, 250, 252, 0.9);
+  padding: 0.55rem 0.65rem;
+  font: inherit;
+  resize: vertical;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.feature-editor__table input:focus,
+.feature-editor__table textarea:focus {
+  outline: none;
+  border-color: rgba(59, 130, 246, 0.55);
+  background: #ffffff;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+}
+
+.feature-editor__table textarea {
+  min-height: 4.5rem;
+  line-height: 1.55;
+}
+
+.feature-editor__actions-header {
+  width: 120px;
+  text-align: center;
+}
+
+.feature-editor__row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.feature-editor__remove {
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  background: rgba(254, 226, 226, 0.65);
+  color: #b91c1c;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.feature-editor__remove:hover,
+.feature-editor__remove:focus-visible {
+  background: rgba(248, 113, 113, 0.18);
+  border-color: rgba(248, 113, 113, 0.8);
+  color: #7f1d1d;
+  box-shadow: 0 10px 20px rgba(248, 113, 113, 0.15);
+}
+
+.feature-editor__remove:focus-visible {
+  outline: 2px solid rgba(248, 113, 113, 0.35);
+  outline-offset: 2px;
+}
+
+.feature-editor__controls {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.feature-editor__add {
+  padding: 0.45rem 1.1rem;
+  border-radius: 999px;
+  border: 1px dashed rgba(59, 130, 246, 0.45);
+  background: rgba(59, 130, 246, 0.08);
+  color: #1d4ed8;
+  font-size: 0.92rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.feature-editor__add:hover,
+.feature-editor__add:focus-visible {
+  background: rgba(59, 130, 246, 0.16);
+  border-color: rgba(59, 130, 246, 0.7);
+  color: #1e3a8a;
+  box-shadow: 0 8px 18px rgba(59, 130, 246, 0.18);
+}
+
+.feature-editor__add:focus-visible {
+  outline: 2px solid rgba(59, 130, 246, 0.35);
+  outline-offset: 2px;
+}
+
+.feature-editor__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  align-items: center;
+}
+
+.feature-editor__footnote {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #475569;
+  line-height: 1.6;
+}
+
+.feature-editor__empty {
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: #475569;
+  font-size: 0.98rem;
+}
+
+@media (max-width: 960px) {
+  .feature-editor {
+    padding: 1.5rem;
+  }
+
+  .feature-editor__table {
+    min-width: 680px;
+  }
+
+  .feature-editor__actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .feature-editor__actions .project-management-content__button,
+  .feature-editor__actions .project-management-content__secondary {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
 @media (max-width: 1024px) {
   .project-management-page {
     flex-direction: column;

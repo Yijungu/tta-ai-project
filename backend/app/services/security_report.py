@@ -116,7 +116,24 @@ class SecurityReportService:
             project_id=project_id,
             google_id=google_id,
         )
-        filename = f"{project_number} 보안성 결함리포트 v1.0.csv"
+        filename = f"[{project_number}] 보안성 결함리포트 v1.0.csv"
+
+        if self._prompt_request_log_service is not None and project_id:
+            finding_count = int(getattr(csv_dataframe, "shape", (0,))[0] or 0)
+            context_summary = f"{finding_count}건 결함 정리"
+            try:
+                self._prompt_request_log_service.record_request(
+                    project_id=project_id,
+                    menu_id="security-report",
+                    system_prompt="",
+                    user_prompt="Invicti HTML 보고서에서 보안성 결함리포트 CSV를 생성했습니다.",
+                    context_summary=context_summary,
+                )
+            except Exception:  # pragma: no cover - defensive logging guard
+                logger.exception(
+                    "Failed to record security report generation log.",
+                    extra={"project_id": project_id, "google_id": google_id},
+                )
 
         return GeneratedCsv(filename=filename, content=encoded, csv_text=csv_text)
 
@@ -1370,17 +1387,10 @@ class SecurityReportService:
         output.insert(0, "순번", [str(index) for index in range(1, len(output) + 1)])
         output.insert(1, "시험환경 OS", ["시험환경 모든 OS"] * len(output))
 
-        # '결함정도'에서 직접 매핑하여 최종 '결함 정도' 생성 (중간 '위험도' 컬럼 생성하지 않음)
-        severity_map = {
-            "Critical": "H",
-            "High": "H",
-            "Medium": "M",
-            "Low": "L",
-            "Info": "L",
-            "Informational": "L",
-        }
+        # '결함정도' 값을 정규화하여 최종 '결함 정도' 텍스트 생성
         raw_sev = output["결함정도"].fillna("").astype(str)
-        output["결함 정도"] = raw_sev.map(severity_map).fillna("M")
+        normalized_severity = raw_sev.apply(self._normalize_severity)
+        output["결함 정도"] = normalized_severity.replace("", "Medium")
 
         output["발생 빈도"] = output["발생빈도"].fillna("").astype(str)
         output["품질 특성"] = output["품질특성"].fillna("").astype(str)

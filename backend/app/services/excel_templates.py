@@ -382,12 +382,20 @@ def _parse_csv_records(csv_text: str, expected_columns: Sequence[str]) -> List[D
 
 
 FEATURE_LIST_COLUMNS: Sequence[ColumnSpec] = (
-    ColumnSpec(key="대분류", letter="A", style="12"),
-    ColumnSpec(key="중분류", letter="B", style="8"),
-    ColumnSpec(key="소분류", letter="C", style="15"),
+    ColumnSpec(key="개요", letter="A", style="12"),
+    ColumnSpec(key="대분류", letter="B", style="12"),
+    ColumnSpec(key="중분류", letter="C", style="12"),
+    ColumnSpec(key="소분류", letter="D", style="12"),
+    ColumnSpec(key="상세 내용", letter="E", style="12"),
 )
 
-FEATURE_LIST_EXPECTED_HEADERS: Sequence[str] = ["대분류", "중분류", "소분류"]
+FEATURE_LIST_EXPECTED_HEADERS: Sequence[str] = [
+    "개요",
+    "대분류",
+    "중분류",
+    "소분류",
+    "상세 내용",
+]
 
 
 def populate_feature_list(workbook_bytes: bytes, csv_text: str) -> bytes:
@@ -397,6 +405,83 @@ def populate_feature_list(workbook_bytes: bytes, csv_text: str) -> bytes:
     populator = WorksheetPopulator(sheet_bytes, start_row=8, columns=FEATURE_LIST_COLUMNS)
     populator.populate(records)
     return _replace_sheet_bytes(workbook_bytes, populator.to_bytes())
+
+
+def extract_feature_list_records(workbook_bytes: bytes) -> List[Dict[str, str]]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(workbook_bytes), "r") as archive:
+            sheet_bytes = archive.read(_XLSX_SHEET_PATH)
+            try:
+                shared_strings_bytes = archive.read("xl/sharedStrings.xml")
+            except KeyError:
+                shared_strings_bytes = None
+    except zipfile.BadZipFile as exc:  # pragma: no cover - defensive
+        raise ValueError("엑셀 파일 형식이 올바르지 않습니다.") from exc
+
+    ns = {"s": _SPREADSHEET_NS, "x": _XML_NS}
+    sheet_root = ET.fromstring(sheet_bytes)
+    sheet_data = sheet_root.find("s:sheetData", ns)
+    if sheet_data is None:
+        return []
+
+    shared_strings: List[str] = []
+    if shared_strings_bytes:
+        shared_root = ET.fromstring(shared_strings_bytes)
+        for si in shared_root.findall("s:si", ns):
+            text_parts: List[str] = []
+            t_elem = si.find("s:t", ns)
+            if t_elem is not None and t_elem.text is not None:
+                text_parts.append(t_elem.text)
+            else:
+                for run in si.findall("s:r", ns):
+                    run_text = run.find("s:t", ns)
+                    if run_text is not None and run_text.text is not None:
+                        text_parts.append(run_text.text)
+            shared_strings.append("".join(text_parts))
+
+    column_letters = {spec.key: spec.letter for spec in FEATURE_LIST_COLUMNS}
+    column_indices = {spec.letter: spec.key for spec in FEATURE_LIST_COLUMNS}
+
+    records: List[Dict[str, str]] = []
+    for row in sheet_data.findall("s:row", ns):
+        row_index_attr = row.get("r")
+        try:
+            row_index = int(row_index_attr) if row_index_attr else None
+        except ValueError:
+            continue
+        if row_index is None or row_index < 8:
+            continue
+
+        record: Dict[str, str] = {key: "" for key in column_letters}
+        for cell in row.findall("s:c", ns):
+            reference = cell.get("r", "")
+            column = "".join(filter(str.isalpha, reference))
+            key = column_indices.get(column)
+            if not key:
+                continue
+
+            cell_type = cell.get("t")
+            text_value = ""
+            if cell_type == "s":
+                value_elem = cell.find("s:v", ns)
+                if value_elem is not None and value_elem.text:
+                    try:
+                        text_value = shared_strings[int(value_elem.text)]
+                    except (ValueError, IndexError):
+                        text_value = ""
+            elif cell_type == "inlineStr":
+                t_elem = cell.find("s:is/s:t", ns)
+                text_value = t_elem.text if t_elem is not None and t_elem.text else ""
+            else:
+                value_elem = cell.find("s:v", ns)
+                text_value = value_elem.text if value_elem is not None and value_elem.text else ""
+
+            record[key] = text_value.strip()
+
+        if any(record.get(header, "").strip() for header in FEATURE_LIST_EXPECTED_HEADERS):
+            records.append(record)
+
+    return records
 
 
 TESTCASE_COLUMNS: Sequence[ColumnSpec] = (
