@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import UploadFile
-from openpyxl import Workbook
+
+pytest.importorskip("openpyxl")
+from openpyxl import Workbook  # type: ignore
 from starlette.datastructures import Headers
 
 # Ensure the backend/app package is importable when running tests from the repository root.
