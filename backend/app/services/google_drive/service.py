@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-import io
 import logging
-import mimetypes
-import os
-import zipfile
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import HTTPException, UploadFile
@@ -28,15 +23,11 @@ from .metadata import (
 )
 from .naming import drive_name_variants, drive_suffix_matches
 from .templates import (
-    PLACEHOLDER_PATTERNS,
-    PREFERRED_SHARED_CRITERIA_FILE_NAME,
     ResolvedSpreadsheet,
-    SHARED_CRITERIA_NORMALIZED_NAMES,
     SPREADSHEET_RULES,
-    TEMPLATE_ROOT,
-    is_shared_criteria_candidate,
-    load_shared_criteria_template_bytes,
-    normalize_shared_criteria_name,
+    copy_template_tree,
+    ensure_shared_criteria_file,
+    replace_placeholders,
 )
 
 
@@ -57,91 +48,6 @@ class GoogleDriveService:
     @property
     def client(self) -> GoogleDriveClient:
         return self._client
-
-    # ------------------------------------------------------------------
-    # Template helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _replace_placeholders(text: str, exam_number: str) -> str:
-        result = text
-        for placeholder in PLACEHOLDER_PATTERNS:
-            result = result.replace(placeholder, exam_number)
-        return result
-
-    @staticmethod
-    def _replace_in_office_document(data: bytes, exam_number: str) -> bytes:
-        original = io.BytesIO(data)
-        updated = io.BytesIO()
-        with zipfile.ZipFile(original, "r") as source_zip:
-            with zipfile.ZipFile(updated, "w") as target_zip:
-                for item in source_zip.infolist():
-                    content = source_zip.read(item.filename)
-                    try:
-                        decoded = content.decode("utf-8")
-                    except UnicodeDecodeError:
-                        target_zip.writestr(item, content)
-                        continue
-                    replaced = GoogleDriveService._replace_placeholders(decoded, exam_number)
-                    target_zip.writestr(item, replaced.encode("utf-8"))
-        return updated.getvalue()
-
-    @staticmethod
-    def _prepare_template_file_content(path: Path, exam_number: str) -> bytes:
-        raw_bytes = path.read_bytes()
-        extension = path.suffix.lower()
-        if extension in {".docx", ".xlsx", ".pptx"}:
-            raw_bytes = GoogleDriveService._replace_in_office_document(raw_bytes, exam_number)
-        return raw_bytes
-
-    @staticmethod
-    def _guess_mime_type(path: Path) -> str:
-        mime_type, _ = mimetypes.guess_type(path.name)
-        return mime_type or "application/octet-stream"
-
-    async def _copy_template_to_drive(
-        self,
-        tokens: StoredTokens,
-        *,
-        parent_id: str,
-        exam_number: str,
-    ) -> StoredTokens:
-        if not TEMPLATE_ROOT.exists():
-            raise HTTPException(status_code=500, detail="template 폴더를 찾을 수 없습니다.")
-
-        path_to_folder_id: Dict[Path, str] = {TEMPLATE_ROOT: parent_id}
-        active_tokens = tokens
-        for root_dir, dirnames, filenames in os.walk(TEMPLATE_ROOT):
-            current_path = Path(root_dir)
-            drive_parent_id = path_to_folder_id[current_path]
-
-            for dirname in sorted(dirnames):
-                local_dir = current_path / dirname
-                folder_name = self._replace_placeholders(dirname, exam_number)
-                folder, active_tokens = await self._client.create_child_folder(
-                    active_tokens,
-                    name=folder_name,
-                    parent_id=drive_parent_id,
-                )
-                path_to_folder_id[local_dir] = str(folder["id"])
-
-            for filename in sorted(filenames):
-                if is_shared_criteria_candidate(filename):
-                    logger.info("Skip copying shared criteria into project: %s", filename)
-                    continue
-
-                local_file = current_path / filename
-                target_name = self._replace_placeholders(filename, exam_number)
-                content = self._prepare_template_file_content(local_file, exam_number)
-                mime_type = self._guess_mime_type(local_file)
-                _, active_tokens = await self._client.upload_file(
-                    active_tokens,
-                    file_name=target_name,
-                    parent_id=drive_parent_id,
-                    content=content,
-                    content_type=mime_type,
-                )
-
-        return active_tokens
 
     # ------------------------------------------------------------------
     # Token helpers
@@ -310,7 +216,8 @@ class GoogleDriveService:
 
         gs_folder_id = str(folder["id"])
 
-        criteria_sheet, active_tokens, criteria_created = await self._ensure_shared_criteria_file(
+        criteria_sheet, active_tokens, criteria_created = await ensure_shared_criteria_file(
+            self._client,
             active_tokens,
             parent_id=gs_folder_id,
         )
@@ -402,7 +309,8 @@ class GoogleDriveService:
         )
         project_id = str(project_folder["id"])
 
-        active_tokens = await self._copy_template_to_drive(
+        active_tokens = await copy_template_tree(
+            self._client,
             active_tokens,
             parent_id=project_id,
             exam_number=metadata["exam_number"],
@@ -411,7 +319,7 @@ class GoogleDriveService:
         uploaded_files: List[Dict[str, Any]] = []
 
         agreement_name = agreement_file.filename or "시험 합의서.docx"
-        agreement_name = self._replace_placeholders(agreement_name, metadata["exam_number"])
+        agreement_name = replace_placeholders(agreement_name, metadata["exam_number"])
         file_info, active_tokens = await self._client.upload_file(
             active_tokens,
             file_name=agreement_name,
@@ -677,7 +585,8 @@ class GoogleDriveService:
             folder, active_tokens = await self._client.create_root_folder(active_tokens, folder_name="gs")
         gs_folder_id = str(folder["id"])
 
-        file_entry, active_tokens, _ = await self._ensure_shared_criteria_file(
+        file_entry, active_tokens, _ = await ensure_shared_criteria_file(
+            self._client,
             active_tokens,
             parent_id=gs_folder_id,
             preferred_names=(file_name,),
@@ -695,67 +604,4 @@ class GoogleDriveService:
         )
         return content
 
-    # ------------------------------------------------------------------
-    # Shared criteria helpers
-    # ------------------------------------------------------------------
-    async def _ensure_shared_criteria_file(
-        self,
-        tokens: StoredTokens,
-        *,
-        parent_id: str,
-        preferred_names: Optional[Sequence[str]] = None,
-    ) -> Tuple[Dict[str, Any], StoredTokens, bool]:
-        normalized_candidates = set(SHARED_CRITERIA_NORMALIZED_NAMES)
-        upload_name = PREFERRED_SHARED_CRITERIA_FILE_NAME
-        if preferred_names:
-            normalized_candidates.update(
-                normalize_shared_criteria_name(name)
-                for name in preferred_names
-                if isinstance(name, str) and name.strip()
-            )
-            first_valid = next(
-                (name.strip() for name in preferred_names if isinstance(name, str) and name.strip()),
-                None,
-            )
-            if first_valid:
-                upload_name = first_valid
-
-        files, active_tokens = await self._client.list_child_files(
-            tokens,
-            parent_id=parent_id,
-            mime_type=XLSX_MIME_TYPE,
-        )
-
-        for entry in files:
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name")
-            mime_type = entry.get("mimeType")
-            if not isinstance(name, str):
-                continue
-            try:
-                normalized = normalize_shared_criteria_name(name)
-            except Exception:
-                continue
-            if normalized in normalized_candidates:
-                normalized_entry = dict(entry)
-                normalized_entry["mimeType"] = mime_type if isinstance(mime_type, str) else None
-                return normalized_entry, active_tokens, False
-
-        content = load_shared_criteria_template_bytes()
-        uploaded_entry, updated_tokens = await self._client.upload_file(
-            active_tokens,
-            file_name=upload_name,
-            parent_id=parent_id,
-            content=content,
-            content_type=XLSX_MIME_TYPE,
-        )
-        uploaded_entry = dict(uploaded_entry)
-        uploaded_entry.setdefault("name", upload_name)
-        uploaded_entry["mimeType"] = XLSX_MIME_TYPE
-        logger.info(
-            "Uploaded shared criteria template to gs folder: %s",
-            uploaded_entry.get("name"),
-        )
-        return uploaded_entry, updated_tokens, True
 

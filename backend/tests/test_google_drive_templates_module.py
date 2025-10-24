@@ -16,6 +16,7 @@ from app.services.google_drive.templates import (  # noqa: E402
     build_default_shared_criteria_workbook,
     is_shared_criteria_candidate,
     normalize_shared_criteria_name,
+    replace_placeholders,
 )
 
 
@@ -56,4 +57,12 @@ def test_spreadsheet_rules_configured_for_expected_menus() -> None:
     )
     for rule in SPREADSHEET_RULES.values():
         assert "folder_name" in rule and "file_suffix" in rule and callable(rule["populate"])
+
+
+def test_replace_placeholders_substitutes_known_patterns() -> None:
+    sample = "GS-B-XX-XXXX :: GS-B-2X-XXXX"
+    replaced = replace_placeholders(sample, "GS-B-22-1234")
+    assert "GS-B-XX-XXXX" not in replaced
+    assert "GS-B-2X-XXXX" not in replaced
+    assert replaced.count("GS-B-22-1234") == 2
 
