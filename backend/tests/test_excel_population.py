@@ -15,8 +15,11 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.services.excel_templates import (
     FEATURE_LIST_EXPECTED_HEADERS,
+    SECURITY_REPORT_EXPECTED_HEADERS,
     TESTCASE_EXPECTED_HEADERS,
+    extract_feature_list_overview,
     populate_feature_list,
+    populate_security_report,
     populate_testcase_list,
 )
 
@@ -54,8 +57,8 @@ def test_populate_feature_list_inserts_rows() -> None:
     csv_text = "\n".join(
         [
             ",".join(FEATURE_LIST_EXPECTED_HEADERS),
-            "대1,중1,소1",
-            "대2,중2,소2",
+            "대1,중1,소1,상세 설명1",
+            "대2,중2,소2,상세 설명2",
         ]
     )
 
@@ -65,10 +68,33 @@ def test_populate_feature_list_inserts_rows() -> None:
     assert _cell_text(root, "A8") == "대1"
     assert _cell_text(root, "B8") == "중1"
     assert _cell_text(root, "C8") == "소1"
+    assert _cell_text(root, "D8") == "상세 설명1"
     assert _cell_text(root, "A9") == "대2"
     assert _cell_text(root, "B9") == "중2"
     assert _cell_text(root, "C9") == "소2"
+    assert _cell_text(root, "D9") == "상세 설명2"
     assert _cell_text(root, "A10") is None
+
+
+def test_populate_feature_list_sets_project_overview() -> None:
+    template_path = Path("backend/template/가.계획/GS-B-XX-XXXX 기능리스트 v1.0.xlsx")
+    template_bytes = template_path.read_bytes()
+
+    csv_text = "\n".join(
+        [
+            ",".join(FEATURE_LIST_EXPECTED_HEADERS),
+            "대1,중1,소1,기능 상세",
+        ]
+    )
+
+    overview_text = "이 프로젝트는 신규 인증 기능을 제공합니다."
+    updated = populate_feature_list(template_bytes, csv_text, project_overview=overview_text)
+    root = _load_sheet(updated)
+
+    ref, value = extract_feature_list_overview(updated)
+    assert ref is not None
+    assert value == overview_text
+    assert _cell_text(root, ref) == overview_text
 
 
 def test_populate_testcase_list_maps_columns() -> None:
@@ -115,3 +141,45 @@ def test_populate_testcase_list_validates_headers() -> None:
 
     with pytest.raises(ValueError):
         populate_testcase_list(template_bytes, csv_text)
+
+
+def test_populate_security_report_fills_rows() -> None:
+    template_path = Path("backend/template/다.수행/GS-B-2X-XXXX 결함리포트 v1.0.xlsx")
+    template_bytes = template_path.read_bytes()
+
+    csv_header = ",".join(
+        SECURITY_REPORT_EXPECTED_HEADERS
+        + ["Invicti 결과", "위험도", "발생경로", "조치 가이드", "원본 세부내용", "매핑 유형"]
+    )
+    csv_row = ",".join(
+        [
+            "1",
+            "시험환경 모든 OS",
+            "요약",
+            "H",
+            "A",
+            "보안성",
+            "상세 설명",
+            "",
+            "",
+            "비고",
+            "SQL Injection",
+            "High",
+            "/login",
+            "가이드",
+            "세부",
+            "기준표 매칭",
+        ]
+    )
+    csv_text = f"{csv_header}\n{csv_row}"
+
+    updated = populate_security_report(template_bytes, csv_text)
+    root = _load_sheet(updated)
+
+    assert _cell_text(root, "A6") == "1"
+    assert _cell_text(root, "B6") == "시험환경 모든 OS"
+    assert _cell_text(root, "C6") == "요약"
+    assert _cell_text(root, "D6") == "H"
+    assert _cell_text(root, "E6") == "A"
+    assert _cell_text(root, "G6") == "상세 설명"
+    assert _cell_text(root, "J6") == "비고"

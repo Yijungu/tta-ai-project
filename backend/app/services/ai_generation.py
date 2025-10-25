@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence
 import asyncio
+import csv
 import base64
 import io
+import json
 import logging
 import mimetypes
 import os
 import re
 import zipfile
 from pathlib import Path
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Literal
+from typing import Any, Dict, Iterable, List, Literal, Mapping
 from xml.etree import ElementTree as ET
 
 from fastapi import HTTPException, UploadFile
@@ -26,6 +33,8 @@ from openai import (
 )
 
 from ..config import Settings
+from .excel_templates import TESTCASE_EXPECTED_HEADERS
+from .excel_templates.feature_list import normalize_feature_list_records
 from .openai_payload import AttachmentMetadata, OpenAIMessageBuilder
 from .prompt_config import PromptBuiltinContext, PromptConfigService
 from .prompt_request_log import PromptRequestLogService
@@ -43,6 +52,20 @@ class GeneratedCsv:
     filename: str
     content: bytes
     csv_text: str
+    defect_summary: List["DefectSummaryEntry"] | None = None
+    defect_images: Dict[int, List[BufferedUpload]] | None = None
+    project_overview: str | None = None
+
+
+TESTCASE_SCENARIO_SYSTEM_PROMPT = (
+    "당신은 소프트웨어 QA 테스터입니다. 제공된 기능 설명과 참고 이미지를 바탕으로 "
+    "실행 가능한 테스트 시나리오 후보를 정리합니다."
+)
+
+TESTCASE_FINALIZE_SYSTEM_PROMPT = (
+    "당신은 소프트웨어 QA 테스터입니다. 기능별로 정리된 시나리오 요약을 바탕으로 "
+    "테스트케이스 표를 완성합니다."
+)
 
 
 @dataclass
@@ -57,6 +80,27 @@ class PromptContextPreview:
     doc_id: str | None
     include_in_attachment_list: bool
     metadata: Dict[str, Any]
+
+
+@dataclass
+class NormalizedDefect:
+    index: int
+    original_text: str
+    polished_text: str
+
+
+@dataclass(frozen=True)
+class DefectSummaryAttachment:
+    file_name: str
+    original_file_name: str | None = None
+
+
+@dataclass(frozen=True)
+class DefectSummaryEntry:
+    index: int
+    original_text: str
+    polished_text: str
+    attachments: List[DefectSummaryAttachment]
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +201,67 @@ class AIGenerationService:
             return "image"
 
         return "file"
+
+    @classmethod
+    def _normalize_upload_for_openai(cls, upload: BufferedUpload) -> BufferedUpload:
+        content_type = (upload.content_type or "").split(";")[0].strip().lower()
+        extension = Path(upload.name).suffix.lower()
+        if extension in {".html", ".htm"} or content_type == "text/html":
+            return cls._html_to_pdf(upload)
+        return upload
+
+    @staticmethod
+    def _html_to_pdf(upload: BufferedUpload) -> BufferedUpload:
+        try:
+            soup = BeautifulSoup(upload.content, "html.parser")
+            text = soup.get_text(separator="\n", strip=True)
+        except Exception:
+            text = ""
+
+        if not text:
+            try:
+                text = upload.content.decode("utf-8", errors="ignore")
+            except Exception:
+                text = ""
+
+        lines: List[str] = []
+        if text:
+            previous_blank = False
+            for raw_line in text.splitlines():
+                stripped = raw_line.strip()
+                if stripped:
+                    lines.append(stripped)
+                    previous_blank = False
+                elif not previous_blank:
+                    lines.append("")
+                    previous_blank = True
+        if not lines:
+            lines = ["원본 HTML에서 텍스트를 추출하지 못했습니다."]
+
+        pdf_bytes = AIGenerationService._lines_to_pdf(lines)
+
+        stem = Path(upload.name).stem or "document"
+        new_name = f"{stem}.pdf"
+
+        return BufferedUpload(
+            name=new_name,
+            content=pdf_bytes,
+            content_type="application/pdf",
+        )
+
+    @classmethod
+    def _prepare_contexts_for_openai(
+        cls, contexts: Iterable[UploadContext]
+    ) -> List[UploadContext]:
+        prepared: List[UploadContext] = []
+        for context in contexts:
+            normalized_upload = cls._normalize_upload_for_openai(context.upload)
+            if normalized_upload is context.upload:
+                prepared.append(context)
+            else:
+                metadata = dict(context.metadata) if context.metadata is not None else None
+                prepared.append(UploadContext(upload=normalized_upload, metadata=metadata))
+        return prepared
 
     @staticmethod
     def _context_summary(menu_id: str, contexts: List[PromptContextPreview]) -> str:
@@ -272,6 +377,276 @@ class AIGenerationService:
                     extra={"file_id": file_id, "error": str(exc)},
                 )
 
+    async def formalize_defect_notes(
+        self,
+        *,
+        project_id: str,
+        entries: List[Dict[str, str]],
+    ) -> List[NormalizedDefect]:
+        if not entries:
+            raise HTTPException(status_code=422, detail="정제할 결함 항목이 없습니다.")
+
+        client = self._get_client()
+        system_prompt = (
+            "당신은 소프트웨어 시험 결과를 정리하는 품질 보증 문서 작성자입니다. "
+            "사용자가 제공한 비격식 표현을 공문서에 적합한 격식 있는 문장으로 다듬어야 합니다."
+        )
+
+        bullet_lines: List[str] = []
+        for entry in entries:
+            index_value = entry.get("index")
+            text_value = (entry.get("text") or "").strip()
+            if not text_value:
+                continue
+            bullet_lines.append(f"{index_value}. {text_value}")
+
+        if not bullet_lines:
+            raise HTTPException(status_code=422, detail="결함 항목에서 내용을 찾을 수 없습니다.")
+
+        user_prompt = (
+            "다음 결함 설명을 공문서에 맞는 문장으로 다듬어 주세요.\n"
+            "- 결과는 입력 순서를 유지한 번호 매기기 형식으로 작성하세요.\n"
+            "- 각 줄은 '번호. 정제된 문장' 형태여야 합니다.\n"
+            "- 존댓말 어미를 사용하고 한 문장 또는 한 문단으로 간결하게 정리하세요.\n"
+            "- 번호 목록 이외의 설명이나 부가 문장은 작성하지 마세요.\n\n"
+            "입력 결함 목록:\n"
+            + "\n".join(bullet_lines)
+        )
+
+        messages = [
+            OpenAIMessageBuilder.text_message("system", system_prompt),
+            OpenAIMessageBuilder.text_message("user", user_prompt),
+        ]
+
+        try:
+            response = await asyncio.to_thread(
+                client.responses.create,
+                model=self._settings.openai_model,
+                input=messages,
+                temperature=0.2,
+                top_p=0.9,
+                max_output_tokens=600,
+            )
+        except RateLimitError as exc:
+            detail = self._format_openai_error(exc)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "OpenAI 사용량 한도를 초과했습니다. "
+                    "관리자에게 문의하거나 잠시 후 다시 시도해 주세요."
+                    f" ({detail})"
+                ),
+            ) from exc
+        except (PermissionDeniedError, BadRequestError, APIError, OpenAIError) as exc:
+            detail = self._format_openai_error(exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"OpenAI 호출 중 오류가 발생했습니다: {detail}",
+            ) from exc
+        except Exception as exc:  # pragma: no cover - 안전망
+            logger.exception(
+                "Unexpected error while requesting OpenAI response",
+                extra={"project_id": project_id, "menu_id": "defect-report-formalize"},
+            )
+            message = str(exc).strip()
+            detail = (
+                "OpenAI 응답을 가져오는 중 예기치 않은 오류가 발생했습니다."
+                if not message
+                else f"OpenAI 응답을 가져오는 중 예기치 않은 오류가 발생했습니다: {message}"
+            )
+            raise HTTPException(status_code=502, detail=detail) from exc
+
+        response_text = self._extract_response_text(response) or ""
+
+        if self._request_log_service is not None:
+            try:
+                self._request_log_service.record_request(
+                    project_id=project_id,
+                    menu_id="defect-report-formalize",
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    context_summary="결함 목록 정제",
+                    response_text=response_text,
+                )
+            except Exception:  # pragma: no cover - logging must not fail request
+                logger.exception(
+                    "Failed to record prompt request log",
+                    extra={"project_id": project_id, "menu_id": "defect-report-formalize"},
+                )
+
+        if not response_text:
+            raise HTTPException(status_code=502, detail="OpenAI 응답에서 번호 목록을 찾을 수 없습니다.")
+
+        polished_by_index: Dict[int, str] = {}
+        numbered_pattern = re.compile(
+            r"(?:^|\n)\s*(\d+)\.(.*?)(?=(?:\n\s*\d+\.)|\Z)",
+            re.S,
+        )
+
+        for match in numbered_pattern.finditer(response_text):
+            index_str, body = match.groups()
+            try:
+                index_value = int(index_str)
+            except ValueError:
+                continue
+            polished_value = " ".join(body.strip().split())
+            if not polished_value:
+                continue
+            polished_by_index[index_value] = polished_value
+
+        if not polished_by_index:
+            fallback_lines = [
+                line.strip()
+                for line in response_text.splitlines()
+                if line.strip()
+            ]
+            for offset, line in enumerate(fallback_lines, start=1):
+                polished_by_index[offset] = line
+
+        results: List[NormalizedDefect] = []
+        for entry in entries:
+            index_value = int(entry.get("index", 0))
+            original_text = str(entry.get("text") or "").strip()
+            polished_text = polished_by_index.get(index_value, original_text)
+            if not polished_text:
+                continue
+            results.append(
+                NormalizedDefect(
+                    index=index_value,
+                    original_text=original_text,
+                    polished_text=polished_text,
+                )
+            )
+
+        if not results:
+            raise HTTPException(status_code=502, detail="정제된 결함 결과가 비어 있습니다.")
+
+        return results
+
+    async def rewrite_defect_report_cell(
+        self,
+        *,
+        project_id: str,
+        column_key: str,
+        column_label: str | None,
+        original_value: str | None,
+        instructions: str,
+        row_values: Mapping[str, str] | None = None,
+    ) -> str:
+        normalized_instructions = (instructions or "").strip()
+        if not normalized_instructions:
+            raise HTTPException(status_code=422, detail="변경 요청 내용을 입력해 주세요.")
+
+        normalized_column = (column_key or "").strip()
+        if not normalized_column:
+            raise HTTPException(status_code=422, detail="수정할 열 정보를 확인할 수 없습니다.")
+
+        display_label = (column_label or "").strip() or normalized_column
+        current_value = (original_value or "").strip()
+
+        context_lines: List[str] = []
+        if row_values:
+            for key, value in row_values.items():
+                if not isinstance(key, str) or key.strip() == "":
+                    continue
+                if key == normalized_column:
+                    continue
+                value_text = "" if value is None else str(value)
+                value_text = value_text.strip()
+                if not value_text:
+                    continue
+                context_lines.append(f"- {key}: {value_text}")
+
+        system_prompt = (
+            "당신은 소프트웨어 시험 결과를 정리하는 결함 리포트 편집자입니다. "
+            "각 항목은 명확하고 공문서에 적합한 어조를 유지해야 합니다."
+        )
+
+        prompt_parts: List[str] = []
+        if context_lines:
+            prompt_parts.append("행의 다른 항목:\n" + "\n".join(context_lines))
+        prompt_parts.append(f"현재 '{display_label}' 값: {current_value or '없음'}")
+        prompt_parts.append(f"사용자 요청: {normalized_instructions}")
+        prompt_parts.append(
+            "위 정보를 바탕으로 해당 셀에 들어갈 문장을 공문서 어조로 작성해 주세요.\n"
+            "- 출력은 수정된 셀 내용만 제공하세요.\n"
+            "- 필요 시 존댓말을 사용하고 문장은 간결하게 유지하세요."
+        )
+
+        user_prompt = "\n\n".join(prompt_parts)
+
+        client = self._get_client()
+        messages = [
+            OpenAIMessageBuilder.text_message("system", system_prompt),
+            OpenAIMessageBuilder.text_message("user", user_prompt),
+        ]
+
+        try:
+            response = await asyncio.to_thread(
+                client.responses.create,
+                model=self._settings.openai_model,
+                input=messages,
+                temperature=0.2,
+                top_p=0.9,
+                max_output_tokens=400,
+            )
+        except RateLimitError as exc:
+            detail = self._format_openai_error(exc)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "OpenAI 사용량 한도를 초과했습니다. "
+                    "관리자에게 문의하거나 잠시 후 다시 시도해 주세요."
+                    f" ({detail})"
+                ),
+            ) from exc
+        except (PermissionDeniedError, BadRequestError, APIError, OpenAIError) as exc:
+            detail = self._format_openai_error(exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"OpenAI 호출 중 오류가 발생했습니다: {detail}",
+            ) from exc
+        except Exception as exc:  # pragma: no cover - 안전망
+            logger.exception(
+                "Unexpected error while requesting OpenAI response",
+                extra={
+                    "project_id": project_id,
+                    "menu_id": "defect-report-rewrite",
+                    "column": normalized_column,
+                },
+            )
+            message = str(exc).strip()
+            detail = (
+                "OpenAI 응답을 가져오는 중 예기치 않은 오류가 발생했습니다."
+                if not message
+                else f"OpenAI 응답을 가져오는 중 예기치 않은 오류가 발생했습니다: {message}"
+            )
+            raise HTTPException(status_code=502, detail=detail) from exc
+
+        response_text = self._extract_response_text(response) or ""
+
+        if self._request_log_service is not None:
+            try:
+                self._request_log_service.record_request(
+                    project_id=project_id,
+                    menu_id="defect-report-rewrite",
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    context_summary=f"{display_label} 셀 수정",
+                    response_text=response_text,
+                )
+            except Exception:  # pragma: no cover - logging must not fail request
+                logger.exception(
+                    "Failed to record prompt request log",
+                    extra={"project_id": project_id, "menu_id": "defect-report-rewrite"},
+                )
+
+        updated_value = response_text.strip()
+        if not updated_value:
+            raise HTTPException(status_code=502, detail="OpenAI 응답에서 수정된 텍스트를 찾을 수 없습니다.")
+
+        return updated_value
+
     @staticmethod
     def _sanitize_csv(text: str) -> str:
         cleaned = text.strip()
@@ -279,6 +654,569 @@ class AIGenerationService:
         if fence_match:
             cleaned = fence_match.group(1).strip()
         return cleaned
+
+    @staticmethod
+    def _sanitize_json(text: str) -> str:
+        cleaned = text.strip()
+        fence_match = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
+        return cleaned
+
+    async def suggest_testcase_scenarios(
+        self,
+        *,
+        project_id: str,
+        major_category: str,
+        middle_category: str,
+        minor_category: str,
+        feature_description: str,
+        project_overview: str,
+        scenario_count: int,
+        attachments: Sequence[UploadFile],
+    ) -> List[Dict[str, str]]:
+        normalized_count = max(1, min(5, scenario_count))
+        buffered_uploads: List[BufferedUpload] = []
+        metadata_entries: List[Dict[str, Any]] = []
+
+        for index, upload in enumerate(attachments, start=1):
+            try:
+                content = await upload.read()
+            finally:
+                await upload.close()
+
+            name = upload.filename or f"attachment-{index}"
+            buffered_uploads.append(
+                BufferedUpload(
+                    name=name,
+                    content=content,
+                    content_type=upload.content_type,
+                )
+            )
+            metadata_entries.append(
+                {
+                    "label": f"{minor_category or '소분류'} 참고 자료 {index}",
+                    "role": "additional",
+                }
+            )
+
+        contexts: List[UploadContext] = [
+            UploadContext(upload=upload, metadata=metadata)
+            for upload, metadata in zip(buffered_uploads, metadata_entries)
+        ]
+
+        client = self._get_client()
+        uploaded_records: List[tuple[str, bool]] = []
+        attachments_payload: List[AttachmentMetadata] = []
+
+        try:
+            for context in contexts:
+                kind = self._attachment_kind(context.upload)
+                if kind == "image":
+                    attachments_payload.append(
+                        {
+                            "kind": "image",
+                            "image_url": self._image_data_url(context.upload),
+                        }
+                    )
+                else:
+                    file_id = await self._upload_openai_file(client, context)
+                    uploaded_records.append((file_id, False))
+                    attachments_payload.append({"kind": kind, "file_id": file_id})
+
+            feature_lines = [
+                f"대분류: {major_category or '-'}",
+                f"중분류: {middle_category or '-'}",
+                f"소분류: {minor_category or '-'}",
+            ]
+            description_text = feature_description.strip() or "(기능 설명이 제공되지 않았습니다.)"
+            overview_text = project_overview.strip() or "(프로젝트 개요가 제공되지 않았습니다.)"
+
+            instructions = [
+                f"다음 기능에 대해 {normalized_count}개의 테스트 시나리오 후보를 JSON으로 작성해 주세요.",
+                "각 시나리오는 '테스트 시나리오', '입력(사전조건 포함)', '기대 출력(사후조건 포함)' 키를 포함한 객체여야 합니다.",
+                "전체 응답은 {\"scenarios\": [...]} 형태의 JSON 한 개만 반환하고 JSON 외 텍스트는 추가하지 마세요.",
+                "'테스트 시나리오' 값은 테스트 목적을 한 문장으로 명확하게 설명해야 합니다.",
+                "'입력(사전조건 포함)' 값은 실제 예시 데이터를 포함한 단계 번호 목록을 '1. ...' 형식으로 작성하고 줄바꿈으로 구분하세요.",
+                "'기대 출력(사후조건 포함)' 값은 기대되는 시스템 반응을 한 문장으로 요약하세요.",
+                "중복되거나 의미가 겹치는 시나리오는 피하세요.",
+            ]
+
+            user_prompt_parts = [
+                "프로젝트 개요:",
+                overview_text,
+                "",
+                "기능 분류:",
+                "\n".join(feature_lines),
+                "",
+                "기능 설명:",
+                description_text,
+                "",
+                "지시사항:",
+                "\n".join(f"- {line}" for line in instructions),
+            ]
+
+            user_prompt = "\n".join(part for part in user_prompt_parts if part is not None)
+
+            messages = [
+                OpenAIMessageBuilder.text_message("system", TESTCASE_SCENARIO_SYSTEM_PROMPT),
+                OpenAIMessageBuilder.text_message(
+                    "user",
+                    user_prompt,
+                    attachments=attachments_payload if attachments_payload else None,
+                ),
+            ]
+
+            normalized_messages = OpenAIMessageBuilder.normalize_messages(messages)
+
+            try:
+                response = await asyncio.to_thread(
+                    client.responses.create,
+                    model=self._settings.openai_model,
+                    input=normalized_messages,
+                    temperature=0.2,
+                    top_p=0.9,
+                    max_output_tokens=800,
+                )
+            except RateLimitError as exc:
+                detail = self._format_openai_error(exc)
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "OpenAI 사용량 한도를 초과했습니다. "
+                        "관리자에게 문의하거나 잠시 후 다시 시도해 주세요."
+                        f" ({detail})"
+                    ),
+                ) from exc
+            except (PermissionDeniedError, BadRequestError, APIError, OpenAIError) as exc:
+                detail = self._format_openai_error(exc)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"OpenAI 호출 중 오류가 발생했습니다: {detail}",
+                ) from exc
+            except Exception as exc:  # pragma: no cover - 안전망
+                logger.exception(
+                    "Unexpected error while requesting scenario suggestions",
+                    extra={"project_id": project_id},
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="테스트 시나리오를 생성하는 중 예기치 않은 오류가 발생했습니다.",
+                ) from exc
+
+            response_text = self._extract_response_text(response) or ""
+            cleaned = self._sanitize_json(response_text)
+            try:
+                payload = json.loads(cleaned)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail="OpenAI 응답을 JSON으로 해석하지 못했습니다.",
+                ) from exc
+
+            scenarios_raw: Any
+            if isinstance(payload, dict):
+                scenarios_raw = payload.get("scenarios")
+            else:
+                scenarios_raw = payload
+
+            if not isinstance(scenarios_raw, Sequence):
+                raise HTTPException(
+                    status_code=502,
+                    detail="OpenAI 응답에서 시나리오 목록을 찾을 수 없습니다.",
+                )
+
+            normalized: List[Dict[str, str]] = []
+            for entry in scenarios_raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                scenario_text = str(
+                    entry.get("테스트 시나리오")
+                    or entry.get("scenario")
+                    or ""
+                ).strip()
+                input_text = str(
+                    entry.get("입력(사전조건 포함)")
+                    or entry.get("input")
+                    or ""
+                ).strip()
+                expected_text = str(
+                    entry.get("기대 출력(사후조건 포함)")
+                    or entry.get("expected")
+                    or ""
+                ).strip()
+                if not scenario_text:
+                    continue
+                normalized.append(
+                    {
+                        "scenario": scenario_text,
+                        "input": input_text,
+                        "expected": expected_text,
+                    }
+                )
+
+            if not normalized:
+                raise HTTPException(
+                    status_code=502,
+                    detail="OpenAI 응답에서 유효한 테스트 시나리오를 찾을 수 없습니다.",
+                )
+
+            return normalized
+        finally:
+            if uploaded_records:
+                await self._cleanup_openai_files(client, uploaded_records)
+
+    async def generate_testcases_from_scenarios(
+        self,
+        *,
+        project_id: str,
+        project_overview: str,
+        groups: Sequence[Mapping[str, Any]],
+    ) -> GeneratedCsv:
+        if not groups:
+            raise HTTPException(status_code=422, detail="생성할 시나리오가 제공되지 않았습니다.")
+
+        summary_blocks: List[str] = []
+        total_scenarios = 0
+
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            major = str(group.get("majorCategory") or "").strip()
+            middle = str(group.get("middleCategory") or "").strip()
+            minor = str(group.get("minorCategory") or "").strip()
+            description = str(group.get("featureDescription") or "").strip()
+            scenarios = group.get("scenarios")
+            if not isinstance(scenarios, Sequence):
+                continue
+
+            scenario_lines: List[str] = []
+            for index, entry in enumerate(scenarios, start=1):
+                if not isinstance(entry, Mapping):
+                    continue
+                scenario_text = str(entry.get("scenario") or "").strip()
+                input_text = str(entry.get("input") or "").strip()
+                expected_text = str(entry.get("expected") or "").strip()
+                if not scenario_text:
+                    continue
+                total_scenarios += 1
+                scenario_lines.append(
+                    "\n".join(
+                        [
+                            f"{index}. 시나리오: {scenario_text}",
+                            f"   입력: {input_text or '-'}",
+                            f"   기대 출력: {expected_text or '-'}",
+                        ]
+                    )
+                )
+
+            if not scenario_lines:
+                continue
+
+            block_parts = [
+                f"대분류: {major or '-'}",
+                f"중분류: {middle or '-'}",
+                f"소분류: {minor or '-'}",
+            ]
+            if description:
+                block_parts.append(f"기능 설명: {description}")
+            block_parts.append("시나리오:")
+            block_parts.extend(scenario_lines)
+            summary_blocks.append("\n".join(block_parts))
+
+        if not summary_blocks or total_scenarios == 0:
+            raise HTTPException(status_code=422, detail="시나리오 요약이 비어 있습니다.")
+
+        summary_text = "\n\n".join(summary_blocks)
+        overview_text = project_overview.strip() or "(프로젝트 개요가 제공되지 않았습니다.)"
+        headers_text = ", ".join(TESTCASE_EXPECTED_HEADERS)
+
+        user_prompt_parts = [
+            "프로젝트 개요:",
+            overview_text,
+            "",
+            "기능별 시나리오 요약:",
+            summary_text,
+            "",
+            "작성 지침:",
+            "- 위 시나리오를 모두 포함하여 테스트케이스를 작성하세요.",
+            f"- CSV 열은 {headers_text} 순서를 따릅니다.",
+            "- 각 소분류 순서에 따라 테스트 케이스 ID 접두사를 TC-XXX-YYY 형식(예: TC-001-001)으로 부여하고",
+            "  XXX는 소분류 그룹 번호(1부터 시작), YYY는 그룹 내 순번(1부터 시작)으로 3자리 숫자로 작성하세요.",
+            "- '테스트 시나리오' 열은 '모든 입력필드에 유효한 값을 입력하여 기업이 정상적으로 생성되는지 확인'처럼",
+            "  간결하고 자연스러운 한 문장으로 작성하세요.",
+            "- '입력(사전조건 포함)' 열은 실제 예시값을 포함한 단계 번호 목록을 작성하고 각 단계는",
+            "  '1. ...' 형식으로 시작하며 줄바꿈으로 구분하세요.",
+            "- '기대 출력(사후조건 포함)' 열은 기대 결과를 한 문장으로 요약하고 안내 문구나 불필요한 설명을",
+            "  추가하지 마세요.",
+            "- 테스트 결과는 기본값으로 '미실행'을 사용하고 상세 테스트 결과와 비고는 비워 두세요.",
+            "- 여러 줄이 필요한 열은 CSV 규칙에 맞게 큰따옴표로 감싸고 실제 줄바꿈 문자(엔터)를 사용하세요.",
+            "- 출력 예시는 아래와 같이 작성합니다 (각 열은 CSV 쉼표로 구분됩니다):",
+            "  TC-001-001, 모든 입력필드에 유효한 값을 입력하여 기업이 정상적으로 생성되는지 확인, \"1. 모든 입력필드에 유효한 값 입력\\n기업명: test\\n기업코드: TEST1\\n대표명: 홍길동\\n직급: 과장\\n주소: 서울특별시 마포구\\n연락처: 010-1234-5678\\n이메일: test1@gmail.com\\n팩스 번호: 02-123-4567\\n설명: 테스트\\n2. '생성' 버튼 클릭\", 기업이 정상적으로 생성됨, 미실행, ,",
+            "- CSV 이외의 다른 텍스트나 설명을 포함하지 마세요.",
+        ]
+
+        user_prompt = "\n".join(user_prompt_parts)
+
+        client = self._get_client()
+        messages = [
+            OpenAIMessageBuilder.text_message("system", TESTCASE_FINALIZE_SYSTEM_PROMPT),
+            OpenAIMessageBuilder.text_message("user", user_prompt),
+        ]
+
+        normalized_messages = OpenAIMessageBuilder.normalize_messages(messages)
+
+        try:
+            response = await asyncio.to_thread(
+                client.responses.create,
+                model=self._settings.openai_model,
+                input=normalized_messages,
+                temperature=0.2,
+                top_p=0.9,
+                max_output_tokens=1800,
+            )
+        except RateLimitError as exc:
+            detail = self._format_openai_error(exc)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "OpenAI 사용량 한도를 초과했습니다. "
+                    "관리자에게 문의하거나 잠시 후 다시 시도해 주세요."
+                    f" ({detail})"
+                ),
+            ) from exc
+        except (PermissionDeniedError, BadRequestError, APIError, OpenAIError) as exc:
+            detail = self._format_openai_error(exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"OpenAI 호출 중 오류가 발생했습니다: {detail}",
+            ) from exc
+        except Exception as exc:  # pragma: no cover - 안전망
+            logger.exception(
+                "Unexpected error while finalising testcases",
+                extra={"project_id": project_id},
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="테스트케이스를 완성하는 중 예기치 않은 오류가 발생했습니다.",
+            ) from exc
+
+        response_text = self._extract_response_text(response) or ""
+        sanitized = self._sanitize_csv(response_text)
+        if not sanitized:
+            raise HTTPException(status_code=502, detail="OpenAI 응답에서 CSV를 찾을 수 없습니다.")
+
+        encoded = sanitized.encode("utf-8-sig")
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        safe_project = re.sub(r"[^A-Za-z0-9_-]+", "_", project_id)
+        filename = f"{safe_project}_testcase_workflow_{timestamp}.csv"
+
+        return GeneratedCsv(
+            filename=filename,
+            content=encoded,
+            csv_text=sanitized,
+        )
+
+    @staticmethod
+    def _extract_feature_list_project_overview(
+        csv_text: str,
+    ) -> tuple[str, str | None]:
+        project_overview: str | None = None
+        rows_to_keep: list[list[str]] = []
+        awaiting_overview_value = False
+
+        stream = io.StringIO(csv_text)
+        reader = csv.reader(stream)
+
+        for raw_row in reader:
+            row = [cell.strip() for cell in raw_row]
+
+            if not any(row):
+                # Skip completely empty rows altogether.
+                continue
+
+            if awaiting_overview_value and project_overview is None:
+                candidate_indexes = [idx for idx, cell in enumerate(row) if cell]
+                if len(candidate_indexes) == 1:
+                    candidate = row[candidate_indexes[0]].strip()
+                    if candidate:
+                        project_overview = candidate
+                        awaiting_overview_value = False
+                        continue
+                awaiting_overview_value = False
+
+            if project_overview is None and row:
+                first_cell = row[0].lstrip("\ufeff").strip()
+                colon_match = re.match(
+                    r"^(?:프로젝트\s*)?개요\s*[:：\-]\s*(.+)$",
+                    first_cell,
+                    re.IGNORECASE,
+                )
+                if colon_match:
+                    candidate = colon_match.group(1).strip()
+                    if candidate:
+                        project_overview = candidate
+                        continue
+
+                normalized_key = re.sub(r"\s+", "", first_cell.lower())
+                if normalized_key in {"프로젝트개요", "개요"}:
+                    remainder = next((cell for cell in row[1:] if cell), "").strip()
+                    if remainder:
+                        project_overview = remainder
+                        continue
+                    awaiting_overview_value = True
+                    continue
+
+            rows_to_keep.append(raw_row)
+
+        if project_overview is None:
+            fallback_match = re.search(
+                r"(?:^|\n)\s*(?:프로젝트\s*)?개요\s*(?:[:：\-]\s*)?(.+)",
+                csv_text,
+            )
+            if fallback_match:
+                project_overview = fallback_match.group(1).strip()
+
+        if not rows_to_keep:
+            return "", project_overview
+
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        for row in rows_to_keep:
+            writer.writerow(row)
+        return output.getvalue().strip(), project_overview
+
+    @staticmethod
+    def _format_feature_list_program_overview(
+        records: Sequence[Mapping[str, str]],
+        raw_overview: str | None,
+        *,
+        max_features: int = 6,
+    ) -> str:
+        def _clean_descriptor(value: str | None) -> str:
+            if value is None:
+                return ""
+
+            text = str(value).strip()
+            if not text:
+                return ""
+
+            text = re.sub(r"^(?:프로젝트|프로그램)\s*개요[:：\-]?\s*", "", text, flags=re.IGNORECASE)
+            text = text.replace("\r", " ").replace("\n", " ")
+            text = re.sub(r"\s+", " ", text).strip()
+            text = re.sub(r"^이\s*(?:프로그램|프로젝트)\s*는\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"[.。．]+$", "", text).strip()
+
+            replacements = [
+                ("입니다", ""),
+                ("이다", ""),
+                ("합니다", "하는"),
+                ("됩니다", "되는"),
+                ("구성됩니다", "구성되는"),
+                ("제공합니다", "제공하는"),
+                ("제공됩니다", "제공되는"),
+                ("포함합니다", "포함하는"),
+                ("포함됩니다", "포함되는"),
+                ("지원합니다", "지원하는"),
+                ("지원됩니다", "지원되는"),
+                ("운영됩니다", "운영되는"),
+                ("연동됩니다", "연동되는"),
+                ("실행됩니다", "실행되는"),
+                ("따릅니다", "따르는"),
+            ]
+
+            for suffix, replacement in replacements:
+                if text.endswith(suffix):
+                    text = text[: -len(suffix)] + replacement
+                    break
+
+            text = text.strip()
+            if text.endswith("다"):
+                text = text[:-1].strip()
+            if text.endswith("요"):
+                text = text[:-1].strip()
+
+            return text.strip()
+
+        def _fallback_descriptor(entries: Sequence[Mapping[str, str]]) -> str:
+            for key in ("대분류", "중분류", "소분류"):
+                seen: set[str] = set()
+                ordered: list[str] = []
+                for entry in entries:
+                    candidate = str(entry.get(key, "") or "").strip()
+                    if not candidate:
+                        continue
+                    normalized = re.sub(r"\s+", " ", candidate)
+                    if normalized and normalized not in seen:
+                        seen.add(normalized)
+                        ordered.append(normalized)
+                if ordered:
+                    if len(ordered) == 1:
+                        return f"{ordered[0]} 관련"
+                    joined = ", ".join(ordered[:3])
+                    return f"{joined} 관련"
+            return "주요 업무를 지원하는"
+
+        def _compose_sentence(descriptor: str) -> str:
+            descriptor = re.sub(r"\s+", " ", descriptor).strip()
+            if not descriptor:
+                descriptor = "주요 업무를 지원하는"
+
+            suffix_candidates = (
+                "프로그램",
+                "시스템",
+                "플랫폼",
+                "솔루션",
+                "서비스",
+                "애플리케이션",
+                "앱",
+            )
+
+            if any(descriptor.endswith(suffix) for suffix in suffix_candidates):
+                body = descriptor
+            else:
+                body = f"{descriptor} 프로그램"
+
+            sentence = f"이 프로그램은 {body}이다."
+            sentence = re.sub(r"\s+", " ", sentence).strip()
+            if not sentence.endswith("."):
+                sentence += "."
+            return sentence
+
+        def _collect_feature_summaries(entries: Sequence[Mapping[str, str]]) -> list[str]:
+            summaries: list[str] = []
+            seen: set[str] = set()
+            for entry in entries:
+                for key in ("기능 설명", "소분류", "중분류", "대분류"):
+                    raw_value = entry.get(key, "")
+                    if not raw_value:
+                        continue
+                    candidate = re.sub(r"\s+", " ", str(raw_value).strip())
+                    if not candidate:
+                        continue
+                    if candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    summaries.append(candidate)
+                    break
+                if len(summaries) >= max_features:
+                    break
+
+            if not summaries:
+                summaries.append("주요 업무를 지원하는 기능")
+
+            return summaries
+
+        descriptor = _clean_descriptor(raw_overview)
+        if not descriptor:
+            descriptor = _fallback_descriptor(records)
+
+        first_line = _compose_sentence(descriptor)
+        features = _collect_feature_summaries(records)
+
+        lines = [first_line, "기능은"]
+        lines.extend(f"- {feature}" for feature in features)
+        return "\n".join(lines)
 
     def _convert_required_documents_to_pdf(
         self,
@@ -330,10 +1268,12 @@ class AIGenerationService:
             converted = self._convert_docx_upload_to_pdf(upload, label)
         elif extension == "xlsx":
             converted = self._convert_xlsx_upload_to_pdf(upload, label)
+        elif extension == "csv":
+            converted = self._convert_csv_upload_to_pdf(upload, label)
         else:
             raise HTTPException(
                 status_code=422,
-                detail=f"{label}은(는) PDF 또는 지원되는 문서 형식(DOCX, XLSX)이어야 합니다.",
+                detail=f"{label}은(는) PDF 또는 지원되는 문서 형식(DOCX, XLSX, CSV)이어야 합니다.",
             )
 
         self._append_conversion_note(metadata, label, original_extension)
@@ -435,6 +1375,36 @@ class AIGenerationService:
 
         return AIGenerationService._build_pdf_upload(upload, rows)
 
+    @staticmethod
+    def _convert_csv_upload_to_pdf(
+        upload: BufferedUpload, label: str
+    ) -> BufferedUpload:
+        decoded: str | None = None
+        last_error: Exception | None = None
+        for encoding in ("utf-8-sig", "utf-8", "cp949", "latin-1"):
+            try:
+                decoded = upload.content.decode(encoding)
+                break
+            except UnicodeDecodeError as exc:
+                last_error = exc
+
+        if decoded is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label} CSV 파일을 읽는 중 오류가 발생했습니다.",
+            ) from last_error
+
+        try:
+            reader = csv.reader(io.StringIO(decoded))
+            rows = [[cell.strip() for cell in row] for row in reader]
+        except csv.Error as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label} CSV 파일을 PDF로 변환하는 중 오류가 발생했습니다.",
+            ) from exc
+
+        return AIGenerationService._build_pdf_upload(upload, rows)
+
     async def generate_csv(
         self,
         project_id: str,
@@ -478,6 +1448,10 @@ class AIGenerationService:
             buffered, metadata_entries
         )
 
+        defect_prompt_section: str | None = None
+        defect_summary_entries: List[DefectSummaryEntry] | None = None
+        defect_image_map: Dict[int, List[BufferedUpload]] = {}
+
         contexts: List[UploadContext] = []
         for index, upload in enumerate(buffered):
             entry = metadata_entries[index] if index < len(metadata_entries) else None
@@ -486,6 +1460,14 @@ class AIGenerationService:
         contexts.extend(
             self._builtin_attachment_contexts(menu_id, prompt_config.builtin_contexts)
         )
+
+        if menu_id == "defect-report":
+            (
+                contexts,
+                defect_prompt_section,
+                defect_summary_entries,
+                defect_image_map,
+            ) = self._prepare_defect_report_contexts(contexts)
 
         client = self._get_client()
         uploaded_file_records: List[tuple[str, bool]] = []
@@ -552,6 +1534,9 @@ class AIGenerationService:
                     user_prompt_parts.append(f"{label}\n{content}")
                 elif label or content:
                     user_prompt_parts.append(label or content)
+
+            if defect_prompt_section:
+                user_prompt_parts.append(defect_prompt_section)
 
             if contexts:
                 heading = prompt_config.scaffolding.attachments_heading.strip()
@@ -699,6 +1684,17 @@ class AIGenerationService:
                 raise HTTPException(status_code=502, detail="OpenAI 응답에서 CSV를 찾을 수 없습니다.")
 
             sanitized = self._sanitize_csv(response_text)
+            project_overview: str | None = None
+            if menu_id == "feature-list" and sanitized:
+                sanitized, raw_project_overview = self._extract_feature_list_project_overview(
+                    sanitized
+                )
+                records = normalize_feature_list_records(sanitized)
+                project_overview = self._format_feature_list_program_overview(
+                    records,
+                    raw_project_overview,
+                )
+
             if not sanitized:
                 raise HTTPException(status_code=502, detail="생성된 CSV 내용이 비어 있습니다.")
 
@@ -707,7 +1703,14 @@ class AIGenerationService:
             safe_project = re.sub(r"[^A-Za-z0-9_-]+", "_", project_id)
             filename = f"{safe_project}_{menu_id}_{timestamp}.csv"
 
-            return GeneratedCsv(filename=filename, content=encoded, csv_text=sanitized)
+            return GeneratedCsv(
+                filename=filename,
+                content=encoded,
+                csv_text=sanitized,
+                defect_summary=defect_summary_entries,
+                defect_images=dict(defect_image_map) if defect_image_map else None,
+                project_overview=project_overview,
+            )
         finally:
             if uploaded_file_records:
                 await self._cleanup_openai_files(client, uploaded_file_records)
@@ -837,6 +1840,123 @@ class AIGenerationService:
         encoded = base64.b64encode(upload.content).decode("ascii")
         return f"data:{media_type};base64,{encoded}"
 
+    def _prepare_defect_report_contexts(
+        self, contexts: List[UploadContext]
+    ) -> tuple[
+        List[UploadContext],
+        str | None,
+        List[DefectSummaryEntry] | None,
+        Dict[int, List[BufferedUpload]],
+    ]:
+        summary_entries: List[DefectSummaryEntry] | None = None
+        prompt_section: str | None = None
+        image_map: Dict[int, List[BufferedUpload]] = defaultdict(list)
+        filtered_contexts: List[UploadContext] = []
+
+        for context in contexts:
+            metadata = context.metadata or {}
+            upload = context.upload
+            defect_index_value = metadata.get("defect_index")
+            if defect_index_value is not None:
+                try:
+                    defect_index = int(defect_index_value)
+                except (TypeError, ValueError):
+                    defect_index = None
+                else:
+                    if self._attachment_kind(upload) == "image":
+                        image_map[defect_index].append(upload)
+
+            is_json_upload = upload.name.lower().endswith(".json") or (
+                (upload.content_type or "").split(";")[0].lower() == "application/json"
+            )
+
+            if is_json_upload:
+                if summary_entries is None:
+                    parsed = self._parse_defect_summary_upload(upload)
+                    if parsed:
+                        summary_entries = parsed
+                        prompt_section = self._format_defect_prompt_section(parsed)
+                continue
+
+            filtered_contexts.append(context)
+
+        return filtered_contexts, prompt_section, summary_entries, image_map
+
+    @staticmethod
+    def _parse_defect_summary_upload(upload: BufferedUpload) -> List[DefectSummaryEntry]:
+        try:
+            decoded = upload.content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            decoded = upload.content.decode("utf-8", errors="ignore")
+
+        try:
+            payload = json.loads(decoded)
+        except json.JSONDecodeError:
+            return []
+
+        defects = payload.get("defects") if isinstance(payload, dict) else None
+        if not isinstance(defects, list):
+            return []
+
+        entries: List[DefectSummaryEntry] = []
+        for item in defects:
+            if not isinstance(item, dict):
+                continue
+            index_value = item.get("index")
+            polished_text = item.get("polishedText")
+            if not isinstance(index_value, int) or not isinstance(polished_text, str):
+                continue
+            original_text = item.get("originalText")
+            if not isinstance(original_text, str):
+                original_text = ""
+
+            attachments_raw = item.get("attachments")
+            attachments: List[DefectSummaryAttachment] = []
+            if isinstance(attachments_raw, list):
+                for attachment in attachments_raw:
+                    if not isinstance(attachment, dict):
+                        continue
+                    file_name = attachment.get("fileName")
+                    original_name = attachment.get("originalFileName")
+                    if isinstance(file_name, str) and file_name.strip():
+                        attachments.append(
+                            DefectSummaryAttachment(
+                                file_name=file_name.strip(),
+                                original_file_name=original_name
+                                if isinstance(original_name, str)
+                                else None,
+                            )
+                        )
+
+            entries.append(
+                DefectSummaryEntry(
+                    index=index_value,
+                    original_text=original_text.strip(),
+                    polished_text=polished_text.strip(),
+                    attachments=attachments,
+                )
+            )
+
+        return entries
+
+    @staticmethod
+    def _format_defect_prompt_section(entries: List[DefectSummaryEntry]) -> str | None:
+        if not entries:
+            return None
+
+        lines: List[str] = ["정제된 결함 목록", ""]
+        for entry in sorted(entries, key=lambda item: item.index):
+            polished = entry.polished_text or "-"
+            lines.append(f"{entry.index}. {polished}")
+            if entry.original_text:
+                lines.append(f"   - 원문: {entry.original_text}")
+            if entry.attachments:
+                names = ", ".join(att.file_name for att in entry.attachments)
+                lines.append(f"   - 첨부 이미지: {names}")
+            lines.append("")
+
+        return "\n".join(line for line in lines if line is not None).strip()
+
     def _builtin_attachment_contexts(
         self, menu_id: str, builtin_contexts: List[PromptBuiltinContext]
     ) -> List[UploadContext]:
@@ -856,11 +1976,136 @@ class AIGenerationService:
             contexts.append(UploadContext(upload=upload, metadata=metadata))
         return contexts
 
+    def _locate_builtin_source(self, path_hint: str) -> tuple[Path | None, List[Path]]:
+        """Resolve the on-disk path for a builtin attachment.
+
+        Historically the API server has been executed from different working
+        directories (package install, repo checkout, Docker image).  In those
+        environments the template assets may live under either the backend
+        package directory (e.g. ``backend/template``) or directly under the
+        application root (``/app/template`` inside the container).  The
+        original implementation assumed a single location which caused
+        ``FileNotFoundError`` when the active runtime layout differed,
+        surfacing to the user as “내장 XLSX 템플릿을 찾을 수 없습니다.”.
+
+        To make the lookup resilient we try several sensible base paths and
+        keep track of the attempted locations for diagnostics.
+        """
+
+        attempted: List[Path] = []
+        requested = Path(path_hint)
+
+        def _candidate(path: Path) -> Optional[Path]:
+            resolved = path if path.is_absolute() else path.resolve()
+            attempted.append(resolved)
+            if resolved.exists() and resolved.is_file():
+                return resolved
+            return None
+
+        if requested.is_absolute():
+            resolved = _candidate(requested)
+            if resolved is not None:
+                return resolved, attempted
+
+        override_root = getattr(self._settings, "builtin_template_root", None)
+        if override_root:
+            override_path = Path(override_root)
+
+            if override_path.is_file():
+                resolved = _candidate(override_path)
+                if resolved is not None:
+                    return resolved, attempted
+
+            relative_variants: List[Path] = []
+
+            if str(requested):
+                relative_variants.append(requested)
+
+            try:
+                relative_to_template = requested.relative_to(Path("template"))
+            except ValueError:
+                relative_to_template = None
+            if relative_to_template and str(relative_to_template):
+                relative_variants.append(relative_to_template)
+
+            parts = list(requested.parts)
+            if parts and parts[0] == "backend":
+                relative_variants.append(Path(*parts[1:]))
+                if len(parts) > 1 and parts[1] == "template":
+                    relative_variants.append(Path(*parts[2:]))
+
+            seen: set[Path] = set()
+            ordered_variants: List[Path] = []
+            for variant in relative_variants:
+                variant_str = str(variant)
+                if not variant_str or variant_str == ".":
+                    continue
+                if variant in seen:
+                    continue
+                seen.add(variant)
+                ordered_variants.append(variant)
+
+            if override_path.is_dir():
+                for variant in ordered_variants:
+                    resolved = _candidate(override_path / variant)
+                    if resolved is not None:
+                        return resolved, attempted
+            else:
+                for variant in ordered_variants:
+                    resolved = _candidate(override_path.parent / variant)
+                    if resolved is not None:
+                        return resolved, attempted
+
+        base_path = Path(__file__).resolve().parents[2]
+        resolved = _candidate(base_path / requested)
+        if resolved is not None:
+            return resolved, attempted
+
+        repo_root = base_path.parent
+        if repo_root != base_path:
+            resolved = _candidate(repo_root / requested)
+            if resolved is not None:
+                return resolved, attempted
+
+        template_root = base_path / "template"
+        if template_root.exists():
+            try:
+                relative_to_template = requested.relative_to(Path("template"))
+            except ValueError:
+                relative_to_template = requested
+
+            resolved = _candidate(template_root / relative_to_template)
+            if resolved is not None:
+                return resolved, attempted
+
+            # As a last resort search by filename inside the template tree so
+            # renamed folders (e.g. when the repo is vendored) still resolve.
+            if requested.name:
+                for match in template_root.rglob(requested.name):
+                    resolved = _candidate(match)
+                    if resolved is not None:
+                        return resolved, attempted
+
+        return None, attempted
+
     def _load_builtin_upload(
         self, menu_id: str, builtin: PromptBuiltinContext
     ) -> BufferedUpload:
-        base_path = Path(__file__).resolve().parents[2]
-        source_path = (base_path / builtin.source_path).resolve()
+        source_path, attempted_paths = self._locate_builtin_source(builtin.source_path)
+        if source_path is None:
+            logger.error(
+                "내장 컨텍스트 파일을 찾을 수 없습니다.",
+                extra={
+                    "menu_id": menu_id,
+                    "path": builtin.source_path,
+                    "label": builtin.label,
+                    "attempted_paths": [str(path) for path in attempted_paths],
+                },
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="내장 컨텍스트 파일을 찾을 수 없습니다.",
+            )
         if builtin.render_mode == "xlsx-to-pdf":
             return self._load_xlsx_as_pdf(menu_id, source_path, builtin.label)
 
@@ -975,8 +2220,12 @@ class AIGenerationService:
                 line = ""
             lines.append(line)
 
+        return AIGenerationService._lines_to_pdf(lines)
+
+    @staticmethod
+    def _lines_to_pdf(lines: List[str]) -> bytes:
         if not lines:
-            lines.append("")
+            lines = [""]
 
         def _escape(text: str) -> str:
             encoded = ("\ufeff" + text).encode("utf-16-be")
