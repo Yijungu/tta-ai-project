@@ -6,6 +6,7 @@ from .services.prompt_config import PromptConfigService
 from .services.prompt_request_log import PromptRequestLogService
 from .services.google_drive import GoogleDriveService
 from .services.oauth import GoogleOAuthService
+from .services.scene_extraction import SceneExtractionService
 from .services.security_report import SecurityReportService
 from .token_store import TokenStorage
 from openai import OpenAI
@@ -36,6 +37,7 @@ class Container:
             prompt_request_log_service=self._prompt_request_log_service,
             openai_client=openai_client,
         )
+        self._scene_extraction_service = SceneExtractionService()
 
     @property
     def settings(self) -> Settings:
@@ -68,3 +70,7 @@ class Container:
     @property
     def security_report_service(self) -> SecurityReportService:
         return self._security_report_service
+
+    @property
+    def scene_extraction_service(self) -> SceneExtractionService:
+        return self._scene_extraction_service

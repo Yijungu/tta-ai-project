@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { FileUploader } from '../components/FileUploader'
-import { ALL_FILE_TYPES, type FileType } from '../components/fileUploaderTypes'
+import { ALL_FILE_TYPES, VIDEO_FILE_TYPES, type FileType } from '../components/fileUploaderTypes'
 import { DefectReportWorkflow } from '../components/DefectReportWorkflow'
 import { TestcaseWorkflow } from '../components/testcase-workflow/TestcaseWorkflow'
 import { getBackendUrl } from '../config'
 import { navigate } from '../navigation'
 
 type MenuItemId =
+  | 'configuration-images'
   | 'feature-list'
   | 'testcase-generation'
   | 'defect-report'
@@ -126,6 +127,19 @@ const XLSX_RESULT_MENUS: Set<MenuItemId> = new Set([
 ])
 
 const MENU_ITEMS: MenuItemContent[] = [
+  {
+    id: 'configuration-images',
+    label: '형상 이미지 추출',
+    eyebrow: '형상 이미지',
+    title: '동영상에서 형상 이미지 추출',
+    description:
+      '프로그램 시연 동영상을 업로드하면 장면 전환을 감지해 장면별 대표 이미지를 자동으로 추출합니다.',
+    helper: 'MP4, MOV, AVI, MKV, WEBM 형식의 동영상 파일을 1개 업로드해 주세요.',
+    buttonLabel: '형상 이미지 생성하기',
+    allowedTypes: VIDEO_FILE_TYPES,
+    maxFiles: 1,
+    hideDropzoneWhenFilled: true,
+  },
   {
     id: 'feature-list',
     label: '기능리스트 생성',

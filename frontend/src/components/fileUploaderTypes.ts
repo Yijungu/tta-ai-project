@@ -1,13 +1,20 @@
+const DOCUMENT_FILE_TYPES = [
+  'pdf',
+  'docx',
+  'xlsx',
+  'xls',
+  'txt',
+  'jpg',
+  'png',
+  'csv',
+  'html',
+] as const
+
+const VIDEO_FILE_TYPE_VALUES = ['mp4', 'mov', 'avi', 'mkv', 'webm'] as const
+
 export type FileType =
-  | 'pdf'
-  | 'docx'
-  | 'xlsx'
-  | 'xls'
-  | 'txt'
-  | 'jpg'
-  | 'png'
-  | 'csv'
-  | 'html'
+  | (typeof DOCUMENT_FILE_TYPES)[number]
+  | (typeof VIDEO_FILE_TYPE_VALUES)[number]
 
 interface FileTypeInfo {
   label: string
@@ -67,6 +74,33 @@ export const FILE_TYPE_OPTIONS: Record<FileType, FileTypeInfo> = {
     accept: ['.html', '.htm', 'text/html'],
     extensions: ['html', 'htm'],
   },
+  mp4: {
+    label: 'MP4',
+    accept: ['.mp4', 'video/mp4'],
+    extensions: ['mp4'],
+  },
+  mov: {
+    label: 'MOV',
+    accept: ['.mov', 'video/quicktime'],
+    extensions: ['mov'],
+  },
+  avi: {
+    label: 'AVI',
+    accept: ['.avi', 'video/x-msvideo'],
+    extensions: ['avi'],
+  },
+  mkv: {
+    label: 'MKV',
+    accept: ['.mkv', 'video/x-matroska'],
+    extensions: ['mkv'],
+  },
+  webm: {
+    label: 'WEBM',
+    accept: ['.webm', 'video/webm'],
+    extensions: ['webm'],
+  },
 }
 
-export const ALL_FILE_TYPES = Object.keys(FILE_TYPE_OPTIONS) as FileType[]
+export const ALL_FILE_TYPES = [...DOCUMENT_FILE_TYPES] as FileType[]
+
+export const VIDEO_FILE_TYPES = [...VIDEO_FILE_TYPE_VALUES] as FileType[]
