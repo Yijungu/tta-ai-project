@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ..dependencies import (
     get_ai_generation_service,
     get_drive_service,
+    get_scene_extraction_service,
     get_security_report_service,
 )
 from ..services.ai_generation import AIGenerationService
@@ -26,6 +27,7 @@ from ..services.google_drive import GoogleDriveService
 from ..services.google_drive import defect_reports as drive_defect_reports
 from ..services.google_drive import feature_lists as drive_feature_lists
 from ..services.google_drive.naming import looks_like_header_row
+from ..services.scene_extraction import SceneExtractionError, SceneExtractionService
 from ..services.security_report import SecurityReportService
 from ..services.excel_templates import defect_report, testcases
 from ..services.excel_templates import feature_list as feature_list_templates
@@ -614,6 +616,9 @@ async def generate_project_asset(
     google_id: Optional[str] = Query(None, description="Drive 작업에 사용할 Google 사용자 식별자 (sub)"),
     ai_generation_service: AIGenerationService = Depends(get_ai_generation_service),
     drive_service: GoogleDriveService = Depends(get_drive_service),
+    scene_extraction_service: SceneExtractionService = Depends(
+        get_scene_extraction_service
+    ),
     security_report_service: SecurityReportService = Depends(get_security_report_service),
 ) -> Response:
     uploads = files or []
@@ -707,6 +712,49 @@ async def generate_project_asset(
         }
 
         return JSONResponse(payload)
+
+    if menu_id == "configuration-images":
+        if metadata_entries:
+            await _close_uploads(uploads)
+            raise HTTPException(status_code=422, detail="추가 파일 정보는 입력할 수 없습니다.")
+
+        if len(uploads) != 1:
+            await _close_uploads(uploads)
+            raise HTTPException(status_code=422, detail="동영상 파일을 1개 업로드해 주세요.")
+
+        upload = uploads[0]
+        filename = upload.filename or "configuration-video.mp4"
+        extension = ""
+        if "." in filename:
+            extension = filename.rsplit(".", 1)[-1].lower()
+
+        allowed_video_extensions = {"mp4", "mov", "avi", "mkv", "webm"}
+        if extension not in allowed_video_extensions:
+            await _close_uploads(uploads)
+            raise HTTPException(
+                status_code=422,
+                detail="MP4, MOV, AVI, MKV, WEBM 형식의 동영상만 업로드할 수 있습니다.",
+            )
+
+        try:
+            result = await scene_extraction_service.extract_from_upload(upload)
+        except SceneExtractionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            await _close_uploads(uploads)
+
+        headers = {
+            "Content-Disposition": _build_attachment_header(
+                result.filename, default_filename="configuration-images.zip"
+            ),
+            "Cache-Control": "no-store",
+            "X-Scene-Count": str(result.scene_count),
+            "X-Frame-Count": str(result.frame_count),
+        }
+
+        return StreamingResponse(
+            io.BytesIO(result.content), media_type="application/zip", headers=headers
+        )
 
     if menu_id == "security-report":
         if metadata_entries:

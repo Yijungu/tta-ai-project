@@ -8,6 +8,7 @@ from .services.google_drive import GoogleDriveService
 from .services.prompt_config import PromptConfigService
 from .services.prompt_request_log import PromptRequestLogService
 from .services.oauth import GoogleOAuthService
+from .services.scene_extraction import SceneExtractionService
 from .services.security_report import SecurityReportService
 from .token_store import TokenStorage
 
@@ -53,3 +54,9 @@ def get_security_report_service(
     container: Container = Depends(get_container),
 ) -> SecurityReportService:
     return container.security_report_service
+
+
+def get_scene_extraction_service(
+    container: Container = Depends(get_container),
+) -> SceneExtractionService:
+    return container.scene_extraction_service
