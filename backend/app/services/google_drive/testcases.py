@@ -143,6 +143,9 @@ def parse_testcase_workbook(workbook_bytes: bytes) -> Tuple[str, int, List[str],
     sheet_title = ""
     start_row = 1
     column_map: Dict[str, int] = {}
+    last_major: str = ""
+    last_middle: str = ""
+    last_minor_by_group: Dict[Tuple[str, str], str] = {}
 
     try:
         sheet = workbook.active
@@ -244,6 +247,31 @@ def parse_testcase_workbook(workbook_bytes: bytes) -> Tuple[str, int, List[str],
 
             if not has_values:
                 continue
+
+            major = row_data.get("majorCategory", "").strip()
+            if major:
+                last_major = major
+            else:
+                row_data["majorCategory"] = last_major
+
+            middle = row_data.get("middleCategory", "").strip()
+            if middle:
+                last_middle = middle
+            else:
+                row_data["middleCategory"] = last_middle
+
+            major_key = row_data.get("majorCategory", "")
+            middle_key = row_data.get("middleCategory", "")
+            group_key = (major_key, middle_key)
+
+            minor = row_data.get("minorCategory", "").strip()
+            if minor:
+                last_minor_by_group[group_key] = minor
+            else:
+                fallback_minor = last_minor_by_group.get(group_key, "")
+                row_data["minorCategory"] = fallback_minor
+                if fallback_minor:
+                    last_minor_by_group[group_key] = fallback_minor
 
             extracted_rows.append(row_data)
 
